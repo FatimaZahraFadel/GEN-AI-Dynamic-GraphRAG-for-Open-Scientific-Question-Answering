@@ -88,7 +88,7 @@ class EntityExtractor:
         Authenticated Groq API client (lazy-initialised on first use).
     """
 
-    def __init__(self, model: str = "llama3-8b-8192") -> None:
+    def __init__(self, model: str = "llama-3.1-8b-instant") -> None:
         """
         Initialise the entity extractor.
 

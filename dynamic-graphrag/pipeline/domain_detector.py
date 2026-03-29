@@ -97,7 +97,7 @@ class DomainDetector:
     def __init__(
         self,
         domains: List[str] = DOMAINS,
-        model: str = "llama3-8b-8192",
+        model: str = "llama-3.1-8b-instant",
     ) -> None:
         """
         Initialise the domain detector.
