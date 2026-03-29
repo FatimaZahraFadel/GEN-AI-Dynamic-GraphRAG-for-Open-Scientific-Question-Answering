@@ -17,12 +17,11 @@ class Paper:
         abstract: Abstract text of the paper.
         authors: List of author names.
         year: Publication year.
-        venue: Journal or conference name.
-        citations: Number of citations the paper has received.
-        url: URL to the paper's page or PDF.
-        embedding: Dense vector embedding of the paper (abstract or title+abstract).
+        citation_count: Number of citations the paper has received.
+        source: API or source from which the paper was retrieved
+                (e.g., "semantic_scholar" or "openalex").
+        embedding: Dense vector embedding of the paper (title + abstract).
         relevance_score: Score assigned during filtering (higher = more relevant).
-        source: API or source from which the paper was retrieved (e.g., "semantic_scholar").
     """
 
     paper_id: str
@@ -30,21 +29,28 @@ class Paper:
     abstract: str
     authors: List[str] = field(default_factory=list)
     year: Optional[int] = None
-    venue: Optional[str] = None
-    citations: int = 0
-    url: Optional[str] = None
+    citation_count: int = 0
+    source: str = ""
     embedding: Optional[List[float]] = None
     relevance_score: float = 0.0
-    source: str = ""
 
     def to_dict(self) -> dict:
         """
-        Serialize the Paper instance to a plain dictionary.
+        Serialize the Paper instance to a plain dictionary (embedding excluded).
 
         Returns:
-            dict: Dictionary representation of the paper (embedding excluded).
+            dict: Dictionary representation of the paper.
         """
-        pass
+        return {
+            "paper_id": self.paper_id,
+            "title": self.title,
+            "abstract": self.abstract,
+            "authors": self.authors,
+            "year": self.year,
+            "citation_count": self.citation_count,
+            "source": self.source,
+            "relevance_score": self.relevance_score,
+        }
 
     @classmethod
     def from_dict(cls, data: dict) -> "Paper":
@@ -57,4 +63,13 @@ class Paper:
         Returns:
             Paper: Reconstructed Paper instance.
         """
-        pass
+        return cls(
+            paper_id=data.get("paper_id", ""),
+            title=data.get("title", ""),
+            abstract=data.get("abstract", ""),
+            authors=data.get("authors", []),
+            year=data.get("year"),
+            citation_count=data.get("citation_count", 0),
+            source=data.get("source", ""),
+            relevance_score=data.get("relevance_score", 0.0),
+        )
