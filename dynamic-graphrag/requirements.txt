@@ -1,0 +1,10 @@
+openai
+groq
+sentence-transformers
+networkx
+requests
+python-dotenv
+neo4j
+scikit-learn
+pandas
+numpy
