@@ -106,7 +106,7 @@ class EntityExtractor:
     # ------------------------------------------------------------------
 
     def extract(
-        self, papers: List[Paper]
+        self, papers: List[Paper], question: str = ""
     ) -> Tuple[List[Entity], List[Relation]]:
         """
         Extract entities and relations from all papers.
@@ -119,6 +119,9 @@ class EntityExtractor:
         ----------
         papers : list[Paper]
             Filtered papers from the previous pipeline stage.
+        question : str
+            Original user question used to focus extraction. Optional but
+            recommended — improves relevance of extracted entities.
 
         Returns
         -------
@@ -131,7 +134,7 @@ class EntityExtractor:
         seen_entity_ids: set[str] = set()
 
         for paper in papers:
-            entities, relations = self.extract_from_abstract(paper)
+            entities, relations = self.extract_from_abstract(paper, question)
 
             for entity in entities:
                 if entity.id not in seen_entity_ids:
@@ -147,7 +150,7 @@ class EntityExtractor:
         return all_entities, all_relations
 
     def extract_from_abstract(
-        self, paper: Paper
+        self, paper: Paper, question: str = ""
     ) -> Tuple[List[Entity], List[Relation]]:
         """
         Extract entities and relations from a single paper's abstract.
@@ -163,6 +166,9 @@ class EntityExtractor:
         ----------
         paper : Paper
             The paper to process.
+        question : str
+            Original user question used to focus extraction on relevant
+            entities and relations. Optional but improves quality.
 
         Returns
         -------
@@ -175,7 +181,7 @@ class EntityExtractor:
             )
             return [], []
 
-        prompt = self.build_extraction_prompt(paper.abstract)
+        prompt = self.build_extraction_prompt(paper.abstract, question)
 
         try:
             client = self._get_client()
@@ -214,18 +220,24 @@ class EntityExtractor:
         )
         return entities, relations
 
-    def build_extraction_prompt(self, abstract: str) -> str:
+    def build_extraction_prompt(self, abstract: str, question: str = "") -> str:
         """
         Build the structured JSON-extraction prompt for the LLM.
 
         The prompt lists the allowed entity types and relation types and
         instructs the model to return **only** a raw JSON object — no
-        markdown, no explanation.
+        markdown, no explanation.  When a question is provided it is placed
+        at the top of the prompt so the model prioritises entities and
+        relations directly relevant to the question.
 
         Parameters
         ----------
         abstract : str
             The paper abstract to analyse.
+        question : str
+            Original user question. When non-empty, guides the extraction
+            toward disease, treatment, cause, and effect entities most
+            relevant to the question topic.
 
         Returns
         -------
@@ -235,9 +247,18 @@ class EntityExtractor:
         entity_types_str = ", ".join(f'"{t}"' for t in ENTITY_TYPES)
         relation_types_str = ", ".join(f'"{t}"' for t in RELATION_TYPES)
 
+        question_block = ""
+        if question:
+            question_block = (
+                f"The user is trying to answer: {question}\n"
+                f"Focus extraction on entities and relations directly relevant "
+                f"to this question. Prioritize: diseases, treatments, causes, "
+                f"effects, and conditions related to the question topic.\n\n"
+            )
+
         return f"""You are a scientific information extraction system.
 
-Extract entities and relationships from the abstract below.
+{question_block}Extract entities and relationships from the abstract below.
 
 Allowed entity types: {entity_types_str}
 Allowed relation types: {relation_types_str}

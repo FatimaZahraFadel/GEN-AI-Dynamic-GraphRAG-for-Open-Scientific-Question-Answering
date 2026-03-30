@@ -15,6 +15,7 @@ Metrics computed per answer:
   - answer_length   : word count (proxy for completeness)
 """
 
+import json
 import os
 import re
 import sys
@@ -387,45 +388,81 @@ class Evaluator:
         from pipeline.graph_retriever import GraphRetriever
         from pipeline.answer_generator import AnswerGenerator
 
-        papers = PaperRetriever(top_n=20).retrieve(question, domain)
-        filtered = PaperFilter().filter(papers, question, top_k=5)
-        entities, relations = EntityExtractor(model=self.model).extract(filtered)
+        papers = PaperRetriever(top_n=50).retrieve(question, domain)
+        filtered = PaperFilter().filter(papers, question, top_k=10)
+        entities, relations = EntityExtractor(model=self.model).extract(filtered, question)
         graph = GraphBuilder().build(entities, relations)
         retrieval = GraphRetriever().retrieve(question, graph)
         result = AnswerGenerator(model=self.model, temperature=self.temperature).generate(
             question=question,
             context_text=retrieval["context_text"],
             papers=filtered,
+            subgraph=retrieval["subgraph"],
         )
         return result["answer"]
 
     # ------------------------------------------------------------------
-    # Metrics
+    # Metrics — LLM-as-judge
     # ------------------------------------------------------------------
 
-    def score(self, prediction: str, reference: str) -> Dict[str, float]:
+    def score_answer(self, answer: str, question: str) -> Dict[str, int]:
         """
-        Compute all metrics for a single prediction/reference pair.
+        Score an answer on three criteria using an LLM judge (1–5 scale).
+
+        The judge evaluates:
+
+        - **groundedness** — every claim is traceable to a source or graph
+          triple; no invented facts.
+        - **reasoning_depth** — the answer connects multiple concepts and
+          explains relationships.
+        - **hallucination_resistance** — the answer avoids stating facts not
+          present in the provided context (5 = zero hallucination).
 
         Parameters
         ----------
-        prediction : str
-            Generated answer.
-        reference : str
-            Ground-truth reference answer.
+        answer : str
+            The generated answer to evaluate.
+        question : str
+            The original user question the answer addresses.
 
         Returns
         -------
         dict
-            Keys: ``rouge1_f1``, ``rouge2_f1``, ``keyword_coverage``,
-            ``answer_length``.
+            Keys: ``groundedness``, ``reasoning_depth``,
+            ``hallucination_resistance`` — each an integer 1–5.
         """
-        return {
-            "rouge1_f1":        round(rouge_n_f1(prediction, reference, 1), 4),
-            "rouge2_f1":        round(rouge_n_f1(prediction, reference, 2), 4),
-            "keyword_coverage": round(keyword_coverage(prediction, reference), 4),
-            "answer_length":    len(_tokenise(prediction)),
-        }
+        judge_prompt = (
+            f"You are an evaluation judge. Score the following answer "
+            f"to the given question on three criteria, each from 1 to 5:\n"
+            f"- groundedness: every claim is traceable to a source or "
+            f"graph triple, no invented facts\n"
+            f"- reasoning_depth: the answer connects multiple concepts "
+            f"and explains relationships\n"
+            f"- hallucination_resistance: the answer avoids stating facts "
+            f"not present in the provided context (5 = no hallucination)\n\n"
+            f"Return ONLY a JSON object:\n"
+            f"{{\n"
+            f'  "groundedness": <int>,\n'
+            f'  "reasoning_depth": <int>,\n'
+            f'  "hallucination_resistance": <int>\n'
+            f"}}\n"
+            f"No explanation, no markdown, only the JSON object.\n\n"
+            f"Question: {question}\n\n"
+            f"Answer: {answer}"
+        )
+
+        try:
+            raw = self._call_llm(judge_prompt)
+            cleaned = re.sub(r"```(?:json)?|```", "", raw).strip()
+            scores = json.loads(cleaned)
+            return {
+                "groundedness":           int(scores.get("groundedness", 1)),
+                "reasoning_depth":        int(scores.get("reasoning_depth", 1)),
+                "hallucination_resistance": int(scores.get("hallucination_resistance", 1)),
+            }
+        except Exception as e:
+            logger.error(f"LLM judge scoring failed: {e}")
+            return {"groundedness": 1, "reasoning_depth": 1, "hallucination_resistance": 1}
 
     # ------------------------------------------------------------------
     # Benchmark runner
@@ -490,8 +527,10 @@ class Evaluator:
                 print(f"ERROR: {e}")
             time.sleep(delay)
 
-            classic_scores = self.score(classic_answer, ref)
-            graphrag_scores = self.score(graphrag_answer, ref)
+            print("  Scoring with LLM judge...", end=" ", flush=True)
+            classic_scores = self.score_answer(classic_answer, q)
+            graphrag_scores = self.score_answer(graphrag_answer, q)
+            print("done.")
 
             results.append({
                 "domain":          domain,
@@ -504,19 +543,21 @@ class Evaluator:
             })
 
             print(
-                f"  Classic  → ROUGE-1: {classic_scores['rouge1_f1']:.3f}  "
-                f"KW-cov: {classic_scores['keyword_coverage']:.3f}"
+                f"  Classic  → G:{classic_scores['groundedness']}  "
+                f"R:{classic_scores['reasoning_depth']}  "
+                f"H:{classic_scores['hallucination_resistance']}"
             )
             print(
-                f"  GraphRAG → ROUGE-1: {graphrag_scores['rouge1_f1']:.3f}  "
-                f"KW-cov: {graphrag_scores['keyword_coverage']:.3f}"
+                f"  GraphRAG → G:{graphrag_scores['groundedness']}  "
+                f"R:{graphrag_scores['reasoning_depth']}  "
+                f"H:{graphrag_scores['hallucination_resistance']}"
             )
 
         return results
 
     def aggregate(self, results: List[Dict]) -> Dict:
         """
-        Aggregate per-question scores into mean values per mode and domain.
+        Aggregate per-question LLM-judge scores into means per mode and domain.
 
         Parameters
         ----------
@@ -527,17 +568,17 @@ class Evaluator:
         -------
         dict
             Keys ``"overall"`` and each domain name, each containing
-            ``{"classic": {...}, "graphrag": {...}}`` averaged metric dicts.
+            ``{"classic": {...}, "graphrag": {...}}`` averaged score dicts.
         """
-        metrics = ["rouge1_f1", "rouge2_f1", "keyword_coverage", "answer_length"]
+        metrics = ["groundedness", "reasoning_depth", "hallucination_resistance"]
 
         def _mean_scores(rows: List[Dict], key: str) -> Dict[str, float]:
             agg: Dict[str, float] = {m: 0.0 for m in metrics}
             for r in rows:
                 for m in metrics:
-                    agg[m] += r[key][m]
+                    agg[m] += r[key].get(m, 0)
             n = max(len(rows), 1)
-            return {m: round(agg[m] / n, 4) for m in metrics}
+            return {m: round(agg[m] / n, 2) for m in metrics}
 
         agg: Dict = {
             "overall": {
@@ -558,10 +599,11 @@ class Evaluator:
 
     def print_report(self, results: List[Dict]) -> None:
         """
-        Print a formatted benchmark report to stdout.
+        Print a formatted benchmark report with LLM-judge scores.
 
-        Shows per-question answers, scores for both modes, and an aggregated
-        comparison table broken down by domain.
+        Shows per-question answers and scores for both modes, followed by
+        an aggregated comparison table broken down by domain with a WINNER
+        row for each metric.
 
         Parameters
         ----------
@@ -569,6 +611,7 @@ class Evaluator:
             Output of :meth:`run_benchmark`.
         """
         sep = "=" * 72
+        metrics = ["groundedness", "reasoning_depth", "hallucination_resistance"]
 
         print(f"\n{sep}")
         print("  BENCHMARK REPORT — Dynamic GraphRAG vs Classic RAG")
@@ -582,10 +625,9 @@ class Evaluator:
                 print(f"  {line}")
             cs = r["classic_scores"]
             print(
-                f"  Scores → ROUGE-1: {cs['rouge1_f1']:.3f}  "
-                f"ROUGE-2: {cs['rouge2_f1']:.3f}  "
-                f"KW-cov: {cs['keyword_coverage']:.3f}  "
-                f"Len: {cs['answer_length']} words"
+                f"  Scores → Groundedness: {cs['groundedness']}  "
+                f"Reasoning: {cs['reasoning_depth']}  "
+                f"Anti-hallucination: {cs['hallucination_resistance']}"
             )
             print()
             print("  -- Dynamic GraphRAG Answer --")
@@ -593,36 +635,42 @@ class Evaluator:
                 print(f"  {line}")
             gs = r["graphrag_scores"]
             print(
-                f"  Scores → ROUGE-1: {gs['rouge1_f1']:.3f}  "
-                f"ROUGE-2: {gs['rouge2_f1']:.3f}  "
-                f"KW-cov: {gs['keyword_coverage']:.3f}  "
-                f"Len: {gs['answer_length']} words"
+                f"  Scores → Groundedness: {gs['groundedness']}  "
+                f"Reasoning: {gs['reasoning_depth']}  "
+                f"Anti-hallucination: {gs['hallucination_resistance']}"
             )
             print()
             print("-" * 72)
 
         # Aggregated comparison table
         agg = self.aggregate(results)
-        print(f"\n{sep}")
-        print("  AGGREGATED SCORES")
-        print(sep)
-        header = f"  {'Scope':<18} {'Mode':<10} {'ROUGE-1':>8} {'ROUGE-2':>8} {'KW-cov':>8} {'Length':>7}"
-        print(header)
-        print("  " + "-" * 68)
+        col_w = 12
 
-        def _row(scope: str, mode: str, scores: Dict) -> str:
-            return (
-                f"  {scope:<18} {mode:<10} "
-                f"{scores['rouge1_f1']:>8.3f} "
-                f"{scores['rouge2_f1']:>8.3f} "
-                f"{scores['keyword_coverage']:>8.3f} "
-                f"{scores['answer_length']:>7}"
-            )
+        print(f"\n{sep}")
+        print("  AGGREGATED SCORES  (LLM-as-Judge, scale 1-5)")
+        print(sep)
+
+        header = (
+            f"  {'Scope':<18} {'Mode':<10}"
+            + "".join(f"  {m[:col_w]:>{col_w}}" for m in metrics)
+        )
+        print(header)
+        print("  " + "-" * (28 + len(metrics) * (col_w + 2)))
 
         for scope in ["overall"] + sorted(k for k in agg if k != "overall"):
-            print(_row(scope, "classic",  agg[scope]["classic"]))
-            print(_row(scope, "graphrag", agg[scope]["graphrag"]))
-            print("  " + "-" * 68)
+            c = agg[scope]["classic"]
+            g = agg[scope]["graphrag"]
+            c_row = f"  {scope:<18} {'classic':<10}" + "".join(f"  {c[m]:>{col_w}.2f}" for m in metrics)
+            g_row = f"  {'':<18} {'graphrag':<10}" + "".join(f"  {g[m]:>{col_w}.2f}" for m in metrics)
+            winner_cells = "".join(
+                f"  {'GraphRAG' if g[m] > c[m] else 'Classic ' if c[m] > g[m] else 'Tie     ':>{col_w}}"
+                for m in metrics
+            )
+            w_row = f"  {'':<18} {'WINNER':<10}{winner_cells}"
+            print(c_row)
+            print(g_row)
+            print(w_row)
+            print("  " + "-" * (28 + len(metrics) * (col_w + 2)))
 
         print(f"\n{sep}\n")
 

@@ -7,11 +7,13 @@ Groq LLM to produce a factual, citation-aware answer.
 """
 
 import os
-from typing import Dict, List
+from typing import Dict, List, Optional
 
+import networkx as nx
 from dotenv import load_dotenv
 from groq import Groq
 
+from config.settings import SPARSE_GRAPH_THRESHOLD
 from models.paper import Paper
 from utils.logger import get_logger
 
@@ -69,9 +71,15 @@ class AnswerGenerator:
         question: str,
         context_text: str,
         papers: List[Paper],
+        subgraph: Optional[nx.DiGraph] = None,
     ) -> Dict:
         """
         Main entry point: build the prompt, call Groq, and return results.
+
+        If ``subgraph`` is provided and has fewer than
+        ``SPARSE_GRAPH_THRESHOLD`` edges, the top-3 paper abstracts are
+        appended directly to ``context_text`` before prompt assembly so the
+        LLM has sufficient grounding material.
 
         Parameters
         ----------
@@ -81,6 +89,8 @@ class AnswerGenerator:
             Graph triple context produced by :class:`GraphRetriever`.
         papers : list[Paper]
             Filtered papers whose abstracts provide additional evidence.
+        subgraph : nx.DiGraph or None
+            Retrieved subgraph; used only to check sparseness. Optional.
 
         Returns
         -------
@@ -93,6 +103,18 @@ class AnswerGenerator:
             - ``model``          (str)  — Groq model identifier used
             - ``num_papers_used``(int)  — number of papers included in prompt
         """
+        # Sparse graph check — supplement with raw abstracts when needed
+        if subgraph is not None and subgraph.number_of_edges() < SPARSE_GRAPH_THRESHOLD:
+            logger.warning(
+                f"Sparse graph detected ({subgraph.number_of_edges()} edges < "
+                f"{SPARSE_GRAPH_THRESHOLD}) — supplementing with raw abstracts."
+            )
+            supplement_lines = ["\n--- Supplementary Abstract Context ---"]
+            for i, p in enumerate(papers[:3], 1):
+                snippet = (p.abstract or "")[:400].strip()
+                supplement_lines.append(f"[Supp {i}] {p.title}\n{snippet}")
+            context_text = context_text + "\n" + "\n\n".join(supplement_lines)
+
         prompt = self.build_prompt(question, context_text, papers)
         answer = self._call_llm(prompt)
 

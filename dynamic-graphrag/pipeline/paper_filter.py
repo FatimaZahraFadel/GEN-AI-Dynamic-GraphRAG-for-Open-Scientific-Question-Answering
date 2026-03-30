@@ -59,7 +59,7 @@ class PaperFilter:
         self,
         papers: List[Paper],
         question: str,
-        top_k: int = TOP_N_PAPERS,
+        top_k: int = 30,
     ) -> List[Paper]:
         """
         Main entry point — apply the full filtering and ranking pipeline.

@@ -5,12 +5,16 @@ Primary source  : Semantic Scholar Graph API
 Fallback source : OpenAlex API (used when Semantic Scholar returns no results)
 """
 
+import os
 import time
-from typing import List
+from typing import List, Optional
 
 import requests
+from dotenv import load_dotenv
 
 from config.settings import TOP_N_PAPERS
+
+load_dotenv()
 from models.paper import Paper
 from utils.logger import get_logger
 
@@ -67,6 +71,7 @@ class PaperRetriever:
             ``config.settings.TOP_N_PAPERS``.
         """
         self.top_n = top_n
+        self._ss_api_key: Optional[str] = os.getenv("SEMANTIC_SCHOLAR_API_KEY") or None
 
     # ------------------------------------------------------------------
     # Public API
@@ -165,10 +170,15 @@ class PaperRetriever:
             "limit": self.top_n,
         }
 
+        headers = {}
+        if self._ss_api_key:
+            headers["x-api-key"] = self._ss_api_key
+            logger.debug("Using authenticated Semantic Scholar request.")
+
         for attempt in range(1, _MAX_RETRIES + 1):
             try:
                 logger.debug(f"Semantic Scholar request (attempt {attempt}): {params}")
-                response = requests.get(_SS_BASE_URL, params=params, timeout=10)
+                response = requests.get(_SS_BASE_URL, params=params, headers=headers, timeout=10)
                 response.raise_for_status()
                 data = response.json()
                 papers = self._parse_semantic_scholar(data)
