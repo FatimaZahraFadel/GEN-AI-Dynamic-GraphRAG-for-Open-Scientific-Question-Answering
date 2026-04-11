@@ -1,0 +1,36 @@
+"""Project runtime configuration defaults."""
+
+DOMAINS = [
+    "Agriculture",
+    "Geoscience",
+    "Supply Chain",
+    "Environment",
+]
+
+TOP_N_PAPERS = 25
+MAX_GRAPH_NODES = 200
+EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+SPARSE_GRAPH_THRESHOLD = 3
+DEFAULT_EXTRACTION_TOP_K = 8
+
+# Session/cache behaviour
+SESSION_QUERY_SIMILARITY_THRESHOLD = 0.82
+FOLLOWUP_SKIP_RETRIEVAL_SIMILARITY = 0.93
+SESSION_CACHE_TTL_SECONDS = 1800
+
+# Fast-mode retrieval/filtering
+FAST_MODE_TOP_N_PAPERS = 10
+FAST_MODE_TOP_K_PAPERS = 5
+
+# Entity extraction
+ENTITY_EXTRACTION_MAX_WORKERS = 4
+
+# Prompt/context budgets
+MAX_CONTEXT_TRIPLES = 30
+MAX_ABSTRACT_TOKENS = 180
+ANSWER_PROMPT_TOKEN_BUDGET = 2400
+
+# Confidence-driven control
+GRAPH_CONFIDENCE_THRESHOLD = 0.55
+MAX_GRAPH_EXPANSION_ITERS = 2
+LOW_CONFIDENCE_EXTRA_TOP_N = 8
