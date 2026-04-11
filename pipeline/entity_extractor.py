@@ -9,8 +9,11 @@ feed directly into the graph-building stage.
 
 import json
 import os
+import random
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 from typing import Dict, List, Tuple
 
 from dotenv import load_dotenv
@@ -47,6 +50,12 @@ RELATION_TYPES = [
     "detected_by",
     "studied_in",
 ]
+
+_MAX_EXTRACTION_RETRIES = 3
+_BASE_BACKOFF_SECONDS = 1.0
+_BACKOFF_JITTER_MAX_SECONDS = 0.6
+_MAX_CONCURRENT_LLM_REQUESTS = 2
+_STRICT_JSON_RETRY_MAX = 1
 
 
 def _slugify(text: str) -> str:
@@ -103,6 +112,10 @@ class EntityExtractor:
         self.model = model
         self._client: Groq | None = None
         self.llm_calls: int = 0
+        self._stats_lock = Lock()
+        self._retry_count: int = 0
+        self._json_retry_count: int = 0
+        self._fallback_count: int = 0
 
     # ------------------------------------------------------------------
     # Public API
@@ -170,9 +183,14 @@ class EntityExtractor:
         if runtime_metrics is not None:
             runtime_metrics["llm_calls"] = runtime_metrics.get("llm_calls", 0) + len(papers_to_extract)
 
+        # Reset per-run extraction telemetry.
+        self._retry_count = 0
+        self._json_retry_count = 0
+        self._fallback_count = 0
+
         # Parallel extraction for new papers.
         extracted_results: List[Tuple[str, List[Entity], List[Relation]]] = []
-        worker_count = max(1, min(max_workers, 5))
+        worker_count = max(1, min(max_workers, _MAX_CONCURRENT_LLM_REQUESTS))
 
         if papers_to_extract and worker_count > 1:
             with ThreadPoolExecutor(max_workers=worker_count) as executor:
@@ -199,6 +217,26 @@ class EntityExtractor:
                     seen_entity_ids.add(entity.id)
 
             all_relations.extend(relations)
+
+        successful = sum(1 for _, ents, rels in extracted_results if len(ents) > 0 or len(rels) > 0)
+        attempted = len(papers_to_extract)
+        success_rate = (successful / attempted) if attempted > 0 else 1.0
+
+        logger.info(
+            "Extraction diagnostics: attempted=%d, successful=%d, success_rate=%.2f, retries=%d, json_retries=%d, fallback_used=%d",
+            attempted,
+            successful,
+            success_rate,
+            self._retry_count,
+            self._json_retry_count,
+            self._fallback_count,
+        )
+
+        if runtime_metrics is not None:
+            runtime_metrics["extraction_attempted"] = runtime_metrics.get("extraction_attempted", 0) + attempted
+            runtime_metrics["extraction_successful"] = runtime_metrics.get("extraction_successful", 0) + successful
+            runtime_metrics["extraction_retries"] = runtime_metrics.get("extraction_retries", 0) + self._retry_count
+            runtime_metrics["extraction_fallback_used"] = runtime_metrics.get("extraction_fallback_used", 0) + self._fallback_count
 
         logger.info(
             f"Extraction complete: {len(all_entities)} unique entities, "
@@ -238,32 +276,43 @@ class EntityExtractor:
             )
             return [], []
 
-        prompt = self.build_extraction_prompt(paper.abstract, question)
+        full_prompt = self.build_extraction_prompt(paper.abstract, question)
+        raw_text = self._call_llm_with_retries(full_prompt, max_tokens=1024, call_kind="full", paper_id=paper.paper_id)
+        data = self._parse_json(raw_text) if raw_text else None
 
-        try:
-            client = self._get_client()
-            self.llm_calls += 1
-            response = client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.0,
-                max_tokens=1024,
-            )
-            raw_text = response.choices[0].message.content.strip()
-        except Exception as e:
-            logger.error(
-                f"Groq API error for paper '{paper.paper_id}': {e}"
-            )
-            return [], []
+        # Retry once with stricter JSON instructions if parsing fails.
+        if data is None:
+            for _ in range(_STRICT_JSON_RETRY_MAX):
+                with self._stats_lock:
+                    self._json_retry_count += 1
+                strict_prompt = self.build_strict_extraction_prompt(paper.abstract, question)
+                strict_raw = self._call_llm_with_retries(
+                    strict_prompt,
+                    max_tokens=760,
+                    call_kind="strict-json",
+                    paper_id=paper.paper_id,
+                )
+                data = self._parse_json(strict_raw) if strict_raw else None
+                if data is not None:
+                    break
 
-        # Parse JSON — strip any accidental markdown fences first
-        cleaned = re.sub(r"```(?:json)?|```", "", raw_text).strip()
-        try:
-            data = json.loads(cleaned)
-        except json.JSONDecodeError as e:
+        # Fallback extraction with simpler prompt if full extraction still fails.
+        if data is None:
+            with self._stats_lock:
+                self._fallback_count += 1
+            fallback_prompt = self.build_fallback_extraction_prompt(paper.abstract, question)
+            fallback_raw = self._call_llm_with_retries(
+                fallback_prompt,
+                max_tokens=420,
+                call_kind="fallback",
+                paper_id=paper.paper_id,
+            )
+            data = self._parse_json(fallback_raw) if fallback_raw else None
+
+        if data is None:
             logger.error(
-                f"JSON parse error for paper '{paper.paper_id}': {e}\n"
-                f"Raw response: {raw_text[:300]}"
+                "Extraction failed after retries and fallback for paper '%s'.",
+                paper.paper_id,
             )
             return [], []
 
@@ -309,34 +358,30 @@ class EntityExtractor:
         if question:
             question_block = (
                 f"The user is trying to answer: {question}\n"
-                f"IMPORTANT: Extract ALL entities and relations relevant to this question.\n"
-                f"For agricultural/disease topics, aggressively extract: crop names, disease names, "
-                f"fungal/pathogen names, infection conditions, environmental factors, treatments, "
-                f"symptoms, resistance traits, and management practices.\n"
-                f"Capture relationships like: disease affects crop, environment promotes disease, "
-                f"treatment prevents disease, fungus causes infection, etc.\n\n"
+                f"IMPORTANT: Extract entities and relations that are directly relevant to this question intent.\n"
+                f"Prioritize terms that explain mechanisms, causes, methods, fixes, outcomes, and constraints when present.\n\n"
             )
 
-        return f"""You are an expert scientific information extraction system specialized in agricultural and disease research.
+        return f"""You are an expert scientific information extraction system.
 
 {question_block}Extract ALL entities and relationships from the abstract below.
 
 Entity type guidance:
-- Crop / Organism: crop names (wheat, barley, rice), plant species, organisms, pathogens, fungi, bacteria
-- Disease / Condition: disease names (rust, blight, wilt), infection types, stress conditions
-- Treatment / Method: fungicides, biofungicides, management practices, resistant varieties, cultivation methods
-- Environment / Location: climate terms (humid, warm, wet, dry), geographic regions, soil conditions, weather
-- Cause / Factor: infection triggers (humidity, temperature, moisture), risk factors, predisposing conditions
-- Effect / Outcome: yield loss, damage, symptom manifestation, crop failure, resistance level
+- Crop / Organism: biological systems, organisms, populations, agents, targets
+- Disease / Condition: states, conditions, failures, problems, disorders, anomalies
+- Treatment / Method: methods, interventions, techniques, algorithms, controls
+- Environment / Location: contexts, environments, settings, infrastructure, operating conditions
+- Cause / Factor: drivers, causes, risk factors, inputs, constraints
+- Effect / Outcome: outcomes, effects, performance, impacts, metrics
 
 Relation type guidance:
-- affects: disease affects crop, environment affects disease
-- treats: treatment treats disease, fungicide prevents infection
-- occurs_in: disease occurs in region, infection occurs in condition
-- caused_by: disease caused by fungus, infection caused by moisture
-- leads_to: high humidity leads to fungal infection, infection leads to crop loss
-- detected_by: symptom detected in leaves, disease detected by testing
-- studied_in: fungus studied in wheat, disease studied in humid regions
+- affects: factor/state changes another variable or system behavior
+- treats: method/intervention mitigates condition/problem
+- occurs_in: condition/process appears in a context/environment
+- caused_by: condition/outcome attributable to factor(s)
+- leads_to: upstream mechanism produces downstream outcome
+- detected_by: method/signal identifies condition/pattern
+- studied_in: concept is investigated within a context/domain
 
 IMPORTANT: Maximize entity extraction. Include many entities (target 8-15), not just 1-3. Connect related entities with relations.
 
@@ -358,6 +403,43 @@ Return ONLY a valid JSON object in this exact format — no markdown, no explana
 
 Abstract:
 {abstract}"""
+
+    def build_strict_extraction_prompt(self, abstract: str, question: str = "") -> str:
+        """Build a strict JSON-only extraction prompt for parse-recovery retries."""
+        question_line = f"Question: {question}\n" if question else ""
+        return f"""Return ONLY valid minified JSON (no markdown, no prose, no trailing text).
+{question_line}
+Schema:
+{{
+  "entities": [{{"label": "...", "type": "..."}}],
+  "relations": [{{"source": "...", "target": "...", "relation": "..."}}]
+}}
+
+Allowed relation values: {', '.join(RELATION_TYPES)}
+Allowed type values: {', '.join(ENTITY_TYPES)}
+
+Abstract:
+{abstract}
+"""
+
+    def build_fallback_extraction_prompt(self, abstract: str, question: str = "") -> str:
+        """Build a lightweight fallback extraction prompt with fewer outputs."""
+        question_line = f"Question: {question}\n" if question else ""
+        return f"""Extract a minimal, reliable set of entities and relations.
+{question_line}
+Rules:
+- Return only 4-8 high-confidence entities.
+- Return only 0-6 high-confidence relations.
+- If unsure, return fewer items rather than speculative ones.
+- Output strictly valid JSON with this schema:
+{{
+  "entities": [{{"label": "...", "type": "..."}}],
+  "relations": [{{"source": "...", "target": "...", "relation": "..."}}]
+}}
+
+Abstract:
+{abstract}
+"""
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -435,6 +517,66 @@ Abstract:
                 )
             )
         return relations
+
+    def _parse_json(self, raw_text: str | None) -> dict | None:
+        """Parse model output into JSON dictionary, returning None on failure."""
+        if not raw_text:
+            return None
+        cleaned = re.sub(r"```(?:json)?|```", "", raw_text).strip()
+        try:
+            parsed = json.loads(cleaned)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            return None
+        return None
+
+    def _call_llm_with_retries(
+        self,
+        prompt: str,
+        max_tokens: int,
+        call_kind: str,
+        paper_id: str,
+    ) -> str | None:
+        """Call LLM with exponential backoff and jitter, returning None on final failure."""
+        client = self._get_client()
+        for attempt in range(_MAX_EXTRACTION_RETRIES):
+            try:
+                self.llm_calls += 1
+                response = client.chat.completions.create(
+                    model=self.model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.0,
+                    max_tokens=max_tokens,
+                )
+                return response.choices[0].message.content.strip()
+            except Exception as e:
+                if attempt >= _MAX_EXTRACTION_RETRIES - 1:
+                    logger.error(
+                        "Groq API error (%s) for paper '%s': %s",
+                        call_kind,
+                        paper_id,
+                        e,
+                    )
+                    return None
+
+                wait_seconds = (
+                    _BASE_BACKOFF_SECONDS * (2 ** attempt)
+                    + random.uniform(0.0, _BACKOFF_JITTER_MAX_SECONDS)
+                )
+                with self._stats_lock:
+                    self._retry_count += 1
+                logger.warning(
+                    "Groq API error (%s) for paper '%s' on attempt %d/%d; retrying in %.2fs",
+                    call_kind,
+                    paper_id,
+                    attempt + 1,
+                    _MAX_EXTRACTION_RETRIES,
+                    wait_seconds,
+                )
+                time.sleep(wait_seconds)
+
+        return None
 
     def _get_client(self) -> Groq:
         """

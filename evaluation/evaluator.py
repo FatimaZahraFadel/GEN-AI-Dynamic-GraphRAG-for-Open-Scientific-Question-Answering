@@ -348,7 +348,7 @@ class Evaluator:
     # Classic RAG baseline
     # ------------------------------------------------------------------
 
-    def run_classic_rag(self, question: str, domain: str) -> str:
+    def run_classic_rag(self, question: str, domain: str) -> Dict[str, str]:
         """
         Generate an answer using Classic RAG (plain abstract concatenation).
 
@@ -365,8 +365,9 @@ class Evaluator:
 
         Returns
         -------
-        str
-            Generated answer text.
+        dict
+            ``{"answer": ..., "context": ...}`` where ``context`` is the
+            retrieval context used to generate the answer.
         """
         from pipeline.paper_retriever import PaperRetriever
         from pipeline.paper_filter import PaperFilter
@@ -389,13 +390,17 @@ class Evaluator:
             f"CONTEXT (paper abstracts):\n{context}\n\n"
             f"ANSWER:"
         )
-        return self._call_llm(prompt)
+        answer = self._call_llm(prompt)
+        return {
+            "answer": answer,
+            "context": context,
+        }
 
     # ------------------------------------------------------------------
     # Dynamic GraphRAG
     # ------------------------------------------------------------------
 
-    def run_graphrag(self, question: str, domain: str) -> str:
+    def run_graphrag(self, question: str, domain: str) -> Dict[str, str]:
         """
         Generate an answer using the full Dynamic GraphRAG pipeline.
 
@@ -412,8 +417,9 @@ class Evaluator:
 
         Returns
         -------
-        str
-            Generated answer text.
+        dict
+            ``{"answer": ..., "context": ...}`` where ``context`` is the
+            retrieval context used to generate the answer.
         """
         from main import run_pipeline
         from utils.session_state import SessionState
@@ -424,7 +430,10 @@ class Evaluator:
             session_state=SessionState(),
             return_details=True,
         )
-        return details["answer_dict"]["answer"]
+        return {
+            "answer": details["answer_dict"]["answer"],
+            "context": details.get("retrieval", {}).get("context_text", ""),
+        }
 
     def run_graphrag_mode(self, question: str, mode: str) -> Dict:
         """Run GraphRAG with feature toggles for ablation experiments."""
@@ -464,7 +473,7 @@ class Evaluator:
     # Metrics — LLM-as-judge
     # ------------------------------------------------------------------
 
-    def score_answer(self, answer: str, question: str) -> Dict[str, int]:
+    def score_answer(self, answer: str, question: str, context: str) -> Dict[str, int]:
         """
         Score an answer on three criteria using an LLM judge (1–5 scale).
 
@@ -483,6 +492,8 @@ class Evaluator:
             The generated answer to evaluate.
         question : str
             The original user question the answer addresses.
+        context : str
+            Retrieval context used to generate the answer.
 
         Returns
         -------
@@ -510,6 +521,7 @@ class Evaluator:
             f"}}\n"
             f"No explanation, no markdown, only the JSON object.\n\n"
             f"Question: {question}\n\n"
+            f"Retrieval Context: {context}\n\n"
             f"Answer: {answer}"
         )
 
@@ -539,9 +551,9 @@ class Evaluator:
                 "valid": 0,
             }
 
-    def score_answer_stable(self, answer: str, question: str) -> Dict[str, int]:
+    def score_answer_stable(self, answer: str, question: str, context: str) -> Dict[str, int]:
         """Run judge multiple times and average scores for stability."""
-        score_runs = [self.score_answer(answer, question) for _ in range(self.judge_repeats)]
+        score_runs = [self.score_answer(answer, question, context) for _ in range(self.judge_repeats)]
         keys = ["groundedness", "reasoning", "hallucination", "reasoning_trace_quality"]
         averaged = {
             k: int(round(sum(float(s.get(k, 1)) for s in score_runs) / max(len(score_runs), 1)))
@@ -556,6 +568,7 @@ class Evaluator:
         """Ensure each mode output contains required fields with safe defaults."""
         return {
             "answer": out.get("answer", ""),
+            "context": out.get("context", out.get("retrieval", {}).get("context_text", "")),
             "scores": out.get("scores", {}),
             "metrics": {
                 "runtime": float(out.get("metrics", {}).get("runtime", 0.0)),
@@ -605,10 +618,13 @@ class Evaluator:
                 try:
                     if mode == "classic_rag":
                         t0 = time.perf_counter()
-                        answer = self.run_classic_rag(question, domain)
+                        classic_out = self.run_classic_rag(question, domain)
+                        answer = classic_out["answer"]
+                        context = classic_out["context"]
                         runtime = time.perf_counter() - t0
                         out = {
                             "answer": answer,
+                            "context": context,
                             "metrics": {
                                 "runtime": round(runtime, 4),
                                 "llm_calls": 1,
@@ -654,7 +670,7 @@ class Evaluator:
                     }
 
                 out = self._normalize_mode_output(out)
-                scores = self.score_answer_stable(out["answer"], question)
+                scores = self.score_answer_stable(out["answer"], question, out.get("context", ""))
                 rows.append(
                     {
                         "mode": mode,
@@ -830,7 +846,9 @@ class Evaluator:
                 try:
                     t0 = time.perf_counter()
                     if mode == "classic_rag":
-                        answer = self.run_classic_rag(question, domain)
+                        classic_out = self.run_classic_rag(question, domain)
+                        answer = classic_out["answer"]
+                        context = classic_out["context"]
                         runtime_seconds = time.perf_counter() - t0
                         metrics = {
                             "runtime_seconds": round(runtime_seconds, 4),
@@ -849,11 +867,12 @@ class Evaluator:
                     else:
                         details = self.run_graphrag_mode(question, mode)
                         answer = details["answer_dict"]["answer"]
+                        context = details.get("retrieval", {}).get("context_text", "")
                         metrics = details.get("runtime_metrics", {})
                         graph_confidence = float(details.get("graph_confidence", 0.0))
                         graph_metrics = details.get("graph_metrics", {})
 
-                    scores = self.score_answer(answer, question)
+                    scores = self.score_answer(answer, question, context)
                     rows.append(
                         {
                             "mode": mode,
@@ -1107,26 +1126,32 @@ class Evaluator:
             # Classic RAG
             print("  Running Classic RAG...", end=" ", flush=True)
             try:
-                classic_answer = self.run_classic_rag(q, domain)
+                classic_out = self.run_classic_rag(q, domain)
+                classic_answer = classic_out["answer"]
+                classic_context = classic_out["context"]
                 print("done.")
             except Exception as e:
                 classic_answer = f"[ERROR: {e}]"
+                classic_context = ""
                 print(f"ERROR: {e}")
             time.sleep(delay)
 
             # Dynamic GraphRAG
             print("  Running Dynamic GraphRAG...", end=" ", flush=True)
             try:
-                graphrag_answer = self.run_graphrag(q, domain)
+                graphrag_out = self.run_graphrag(q, domain)
+                graphrag_answer = graphrag_out["answer"]
+                graphrag_context = graphrag_out["context"]
                 print("done.")
             except Exception as e:
                 graphrag_answer = f"[ERROR: {e}]"
+                graphrag_context = ""
                 print(f"ERROR: {e}")
             time.sleep(delay)
 
             print("  Scoring with LLM judge...", end=" ", flush=True)
-            classic_scores = self.score_answer(classic_answer, q)
-            graphrag_scores = self.score_answer(graphrag_answer, q)
+            classic_scores = self.score_answer(classic_answer, q, classic_context)
+            graphrag_scores = self.score_answer(graphrag_answer, q, graphrag_context)
             print("done.")
 
             results.append({

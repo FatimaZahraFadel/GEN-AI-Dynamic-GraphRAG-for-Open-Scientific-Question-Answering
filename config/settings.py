@@ -3,6 +3,7 @@
 DOMAINS = [
     "Agriculture",
     "Geoscience",
+    "Computer Science",
     "Supply Chain",
     "Environment",
 ]

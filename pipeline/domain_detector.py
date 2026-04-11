@@ -1,7 +1,7 @@
 """
 Stage 1 — Domain Detector: classify the scientific domain of a user query.
 
-Supported domains: Agriculture, Geoscience, Supply Chain, Environment.
+Supported domains: Agriculture, Geoscience, Computer Science, Supply Chain, Environment.
 Three classification strategies are provided:
   - llm       : zero-shot classification via Groq (llama3-8b-8192)
   - keyword   : rule-based keyword matching with LLM fallback
@@ -61,6 +61,13 @@ class DomainDetector:
             "erosion", "geology", "seismic", "lithosphere", "mantle", "fault",
             "stratigraphy", "geomorphology", "magma", "plate", "groundwater",
         ],
+        "Computer Science": [
+            "machine learning", "deep learning", "underfitting", "overfitting",
+            "neural network", "model", "training", "feature engineering",
+            "regularization", "cross-validation", "gradient", "optimizer",
+            "transformer", "llm", "classification", "regression",
+            "computer vision", "nlp", "hyperparameter", "dataset",
+        ],
         "Supply Chain": [
             "logistics", "inventory", "supplier", "procurement", "warehouse",
             "distribution", "demand", "forecasting", "sourcing", "transport",
@@ -84,6 +91,10 @@ class DomainDetector:
             "Study of earthquakes, volcanic activity, tectonic plate movement, "
             "mineral formation, sediment erosion, and geological processes."
         ),
+        "Computer Science": (
+            "Research on machine learning, deep learning, model training, "
+            "optimization, algorithms, artificial intelligence, and data-driven systems."
+        ),
         "Supply Chain": (
             "Analysis of logistics networks, inventory management, supplier "
             "procurement, warehouse distribution, and demand forecasting."
@@ -92,6 +103,34 @@ class DomainDetector:
             "Investigation of climate change, carbon emissions, air and water "
             "pollution, biodiversity loss, and deforestation impacts."
         ),
+    }
+
+    _SUBDOMAIN_KEYWORDS: Dict[str, Dict[str, List[str]]] = {
+        "Agriculture": {
+            "plant pathology": ["disease", "pathogen", "fungal", "blight", "rust", "pest"],
+            "crop management": ["fertilizer", "irrigation", "yield", "tillage", "harvest"],
+            "soil systems": ["soil", "rhizosphere", "microbiome", "organic carbon"],
+        },
+        "Geoscience": {
+            "cosmology": ["universe", "cosmology", "dark matter", "galaxy", "big bang"],
+            "earth systems": ["climate", "atmosphere", "ocean", "hydrology", "groundwater"],
+            "solid earth": ["earthquake", "tectonic", "fault", "volcano", "stratigraphy"],
+        },
+        "Computer Science": {
+            "machine learning": ["machine learning", "model", "training", "underfitting", "overfitting"],
+            "deep learning": ["deep learning", "neural network", "transformer", "representation", "backpropagation"],
+            "data and optimization": ["feature", "regularization", "optimizer", "gradient", "hyperparameter"],
+        },
+        "Supply Chain": {
+            "demand planning": ["demand", "forecast", "planning", "inventory", "stockout"],
+            "operations logistics": ["logistics", "warehouse", "shipment", "transport", "lead time"],
+            "procurement risk": ["supplier", "procurement", "sourcing", "risk", "disruption"],
+        },
+        "Environment": {
+            "climate impacts": ["climate", "warming", "emissions", "carbon", "mitigation"],
+            "pollution": ["pollution", "air quality", "water quality", "contaminant", "waste"],
+            "ecosystems": ["biodiversity", "ecosystem", "habitat", "deforestation", "conservation"],
+        },
     }
 
     def __init__(
@@ -157,6 +196,29 @@ class DomainDetector:
         logger.info(f"[{method}] classified '{question[:60]}...' → {result}")
         return result
 
+    def classify_subdomain(self, question: str, domain: str) -> str:
+        """
+        Classify a finer-grained subdomain within the predicted top-level domain.
+
+        Falls back to ``"general"`` when confidence is low or no subdomain map
+        exists for the given domain.
+        """
+        subdomain_map = self._SUBDOMAIN_KEYWORDS.get(domain, {})
+        if not subdomain_map:
+            return "general"
+
+        q = (question or "").lower()
+        scores: Dict[str, int] = {sd: 0 for sd in subdomain_map}
+        for subdomain, kws in subdomain_map.items():
+            for kw in kws:
+                if kw in q:
+                    scores[subdomain] += 1
+
+        best_subdomain = max(scores, key=lambda k: scores[k])
+        if scores[best_subdomain] == 0:
+            return "general"
+        return best_subdomain
+
     def llm_classify(self, question: str) -> str:
         """
         Classify the question via a Groq chat-completion zero-shot prompt.
@@ -216,8 +278,13 @@ class DomainDetector:
 
         best_domain = max(scores, key=lambda d: scores[d])
         if scores[best_domain] == 0:
-            logger.debug("No keyword match found; falling back to LLM classification.")
-            return self.llm_classify(question)
+            logger.debug("No keyword match found; falling back to embedding classification.")
+            return self.embedding_classify(question)
+
+        # If keyword evidence is weak/close, prefer embedding disambiguation.
+        sorted_scores = sorted(scores.values(), reverse=True)
+        if len(sorted_scores) > 1 and (sorted_scores[0] - sorted_scores[1]) <= 1:
+            return self.embedding_classify(question)
 
         return best_domain
 

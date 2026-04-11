@@ -21,7 +21,10 @@ import os
 import sys
 import io
 import time
+import re
 import warnings
+
+import numpy as np
 
 from dotenv import load_dotenv
 
@@ -63,6 +66,128 @@ logger = get_logger(__name__)
 
 _EMBEDDING_SERVICE = EmbeddingService.get_instance(EMBEDDING_MODEL)
 _SESSION_STATE = SessionState()
+
+
+def _extract_query_terms(question: str) -> set[str]:
+    tokens = re.findall(r"\b[a-z0-9\-]{4,}\b", (question or "").lower())
+    stop = {
+        "what", "which", "when", "where", "does", "that", "this", "from",
+        "with", "into", "about", "their", "there", "these", "could", "would",
+        "should", "might", "face", "problem", "problems", "made", "make",
+    }
+    return {token for token in tokens if token not in stop}
+
+
+def _detect_query_intent(question: str) -> str:
+    """Classify intent into fact/cause/process/solution using lightweight rules."""
+    q = (question or "").lower()
+
+    solution_keywords = ["fix", "improve", "reduce", "mitigate", "optimize", "optimization", "solution", "remedy"]
+    list_keywords = ["what are", "list", "techniques", "methods", "strategies", "approaches", "best practices"]
+    cause_keywords = ["why", "cause", "causes", "due to", "reason", "driver", "because"]
+    process_keywords = ["how", "process", "steps", "workflow", "procedure", "implement"]
+
+    if any(k in q for k in list_keywords):
+        if any(k in q for k in solution_keywords):
+            return "solution"
+        return "list"
+    if any(k in q for k in solution_keywords):
+        return "solution"
+    if any(k in q for k in cause_keywords):
+        return "cause"
+    if any(k in q for k in process_keywords):
+        return "process"
+    return "fact"
+
+
+def _apply_graph_intent_bias(entities, relations, filtered_papers) -> None:
+    """Attach intent-aware weights to entities/relations from supporting papers."""
+    paper_weight: dict[str, float] = {}
+    for paper in filtered_papers:
+        pid = paper.paper_id
+        if not pid:
+            continue
+        intent_score = float(getattr(paper, "_intent_score", 0.0))
+        rel_score = float(getattr(paper, "relevance_score", 0.0))
+        paper_weight[pid] = 1.0 + 0.6 * min(max(intent_score, 0.0), 1.0) + 0.3 * min(max(rel_score, 0.0), 1.0)
+
+    for entity in entities:
+        setattr(entity, "intent_weight", paper_weight.get(entity.source_paper_id, 1.0))
+
+    for relation in relations:
+        setattr(relation, "intent_weight", paper_weight.get(relation.source_paper_id, 1.0))
+
+
+def _strict_relevance_gate(
+    question: str,
+    entities,
+    relations,
+    embedding_service: EmbeddingService,
+    strict: bool,
+):
+    """Prune entities/relations that drift away from the user question."""
+    if not strict or len(entities) <= 4:
+        return entities, relations
+
+    query_terms = _extract_query_terms(question)
+    entity_labels = [entity.label for entity in entities]
+    embeddings = embedding_service.encode_batch([question] + entity_labels)
+    query_emb = embeddings[0]
+    entity_embs = embeddings[1:]
+
+    query_norm = query_emb / (float((query_emb @ query_emb) ** 0.5) + 1e-10)
+    entity_norms = entity_embs / (
+        (np.linalg.norm(entity_embs, axis=1, keepdims=True) + 1e-10)
+    )
+    semantic_scores = (entity_norms @ query_norm).astype(float)
+    semantic_scores = (semantic_scores + 1.0) / 2.0
+
+    lexical_scores = []
+    for label in entity_labels:
+        label_tokens = set(re.findall(r"\b[a-z0-9\-]{4,}\b", label.lower()))
+        if not query_terms:
+            lexical_scores.append(0.0)
+            continue
+        overlap = len(label_tokens & query_terms)
+        lexical_scores.append(overlap / max(len(query_terms), 1))
+
+    combined_scores = [0.7 * s + 0.3 * l for s, l in zip(semantic_scores, lexical_scores)]
+
+    base_threshold = 0.32 if strict else 0.24
+    percentile_threshold = float(np.percentile(np.array(combined_scores, dtype=float), 55 if strict else 40))
+    threshold = max(base_threshold, percentile_threshold)
+
+    ranked_indices = sorted(range(len(entities)), key=lambda i: combined_scores[i], reverse=True)
+    kept_indices = [i for i in ranked_indices if combined_scores[i] >= threshold]
+
+    if len(kept_indices) < 5:
+        kept_indices = ranked_indices[:min(5, len(ranked_indices))]
+
+    if query_terms:
+        for i, label in enumerate(entity_labels):
+            label_text = label.lower()
+            if any(term in label_text for term in query_terms):
+                if i not in kept_indices:
+                    kept_indices.append(i)
+
+    kept_indices = sorted(set(kept_indices), key=lambda i: combined_scores[i], reverse=True)
+    kept_ids = {entities[i].id for i in kept_indices}
+    filtered_entities = [entity for entity in entities if entity.id in kept_ids]
+    filtered_relations = [
+        relation for relation in relations
+        if relation.source_id in kept_ids and relation.target_id in kept_ids
+    ]
+
+    logger.info(
+        "Strict relevance gate: kept %d/%d entities, %d/%d relations (threshold=%.3f).",
+        len(filtered_entities),
+        len(entities),
+        len(filtered_relations),
+        len(relations),
+        threshold,
+    )
+
+    return filtered_entities, filtered_relations
 
 
 def run_pipeline(
@@ -119,7 +244,13 @@ def run_pipeline(
     # ------------------------------------------------------------------
     detector = DomainDetector(embedding_service=_EMBEDDING_SERVICE)
     domain = detector.classify(query, method="keyword")
+    subdomain = detector.classify_subdomain(query, domain)
+    intent = _detect_query_intent(query)
     logger.info(f"Detected domain: {domain}")
+    logger.info(f"Detected subdomain: {subdomain}")
+    logger.info(f"Detected intent: {intent}")
+
+    retrieval_domain = domain if subdomain == "general" else f"{domain} {subdomain}"
 
     same_domain = session.domain == domain
     reuse_graph = same_domain and session.should_reuse_graph(query_embedding)
@@ -134,7 +265,7 @@ def run_pipeline(
     top_k = FAST_MODE_TOP_K_PAPERS if (fast_mode and reuse_graph) else 10
 
     # ------------------------------------------------------------------
-    # Stage 2: Paper Retrieval
+    # Stage 2: Paper Retrieval (with LLM query expansion + dual retrieval)
     # ------------------------------------------------------------------
     if (
         enable_confidence
@@ -144,21 +275,39 @@ def run_pipeline(
     ):
         papers = session.get_cached_papers()
         logger.info("Fast mode enabled: skipped retrieval and reused %d cached papers.", len(papers))
+        expanded_query = query  # no expansion needed when skipping retrieval
     else:
-        retriever = PaperRetriever(top_n=top_n)
-        retrieved_papers = retriever.retrieve(query, domain)
+        # Query expansion is embedded inside PaperRetriever.retrieve()
+        # (Step 1 & 2).  We capture the expanded query for logging/expansion
+        # loop re-use by creating the retriever once and calling expand_query.
+        retriever = PaperRetriever(top_n=top_n, use_query_expansion=True)
+        expanded_query = retriever.expand_query(query)
+        logger.info("Expanded query for pipeline: '%s'", expanded_query[:120])
+        retrieved_papers = retriever.retrieve(query, retrieval_domain, expanded_question=expanded_query)
         runtime_metrics["retrieved_papers"] += len(retrieved_papers)
         session.cache_papers(retrieved_papers)
         papers = session.get_cached_papers() if reuse_graph else retrieved_papers
 
     logger.info(f"Retrieved {len(papers)} candidate papers")
+    logger.info("[Step 11 diagnostics] original_query='%s'", query[:80])
+    logger.info("[Step 11 diagnostics] expanded_query='%s'", expanded_query[:120])
 
     # ------------------------------------------------------------------
     # Stage 3: Paper Filtering
     # ------------------------------------------------------------------
     paper_filter = PaperFilter(embedding_service=_EMBEDDING_SERVICE)
-    filtered_papers = paper_filter.filter(papers, query, top_k=top_k)
+    filtered_papers = paper_filter.filter(papers, query, intent=intent, top_k=top_k)
+    evidence_assessment = paper_filter.assess_evidence_consistency(query, filtered_papers)
     logger.info(f"Filtered to {len(filtered_papers)} papers")
+    logger.info(
+        "Intent-relevant papers after filter: %d",
+        paper_filter.last_intent_relevant_count,
+    )
+    logger.info(
+        "Evidence consistency: score=%.3f, consistent=%s",
+        evidence_assessment.get("consistency_score", 0.0),
+        evidence_assessment.get("is_consistent", False),
+    )
 
     # ------------------------------------------------------------------
     # Stage 4: Entity Extraction
@@ -174,6 +323,26 @@ def run_pipeline(
     )
     logger.info(f"Extracted {len(entities)} entities, {len(relations)} relations")
 
+    strict_gate = bool(
+        (not evidence_assessment.get("is_consistent", False))
+        or evidence_assessment.get("consistency_score", 0.0) < 0.25
+    )
+    if strict_gate:
+        entities, relations = _strict_relevance_gate(
+            query,
+            entities,
+            relations,
+            _EMBEDDING_SERVICE,
+            strict=True,
+        )
+        logger.info(
+            "Strict gate active: low_confidence_mode=%s, evidence_consistent=%s",
+            True,
+            evidence_assessment.get("is_consistent", False),
+        )
+
+    _apply_graph_intent_bias(entities, relations, filtered_papers)
+
     # ------------------------------------------------------------------
     # Stage 5: Graph Construction
     # ------------------------------------------------------------------
@@ -182,9 +351,10 @@ def run_pipeline(
         graph = session.graph
         builder.add_entities(graph, entities)
         builder.add_relations(graph, relations)
+        builder.optimize_for_query(graph, query)
         logger.info("Graph incrementally updated from session cache.")
     else:
-        graph = builder.build(entities, relations)
+        graph = builder.build(entities, relations, question=query)
 
     logger.info(
         f"Built graph: {graph.number_of_nodes()} nodes, {graph.number_of_edges()} edges"
@@ -201,6 +371,12 @@ def run_pipeline(
         runtime_metrics=runtime_metrics,
     )
 
+    low_confidence_mode = bool(
+        strict_gate
+        or retrieval.get("graph_confidence", 0.0) < GRAPH_CONFIDENCE_THRESHOLD
+        or retrieval.get("needs_focus_expansion", False)
+    )
+
     expansion_iters = 0
     retrieval_skips = int(
         bool(
@@ -214,9 +390,21 @@ def run_pipeline(
     while (
         enable_confidence
         and enable_expansion
-        and retrieval.get("graph_confidence", 0.0) < GRAPH_CONFIDENCE_THRESHOLD
+        and (
+            retrieval.get("graph_confidence", 0.0) < GRAPH_CONFIDENCE_THRESHOLD
+            or retrieval.get("needs_focus_expansion", False)
+        )
         and expansion_iters < MAX_GRAPH_EXPANSION_ITERS
     ):
+        # Use the LLM-expanded query from Stage 2 (domain-agnostic).
+        # If validation failed and we need focus, rely on the already-expanded
+        # query rather than any hardcoded keywords.
+        if retrieval.get("needs_focus_expansion", False):
+            logger.info(
+                "Graph validation failed; using LLM-expanded query for next retrieval pass: '%s'",
+                expanded_query[:100],
+            )
+
         logger.info(
             "Low graph confidence detected (%.3f < %.3f). Expansion iteration %d/%d.",
             retrieval.get("graph_confidence", 0.0),
@@ -225,25 +413,32 @@ def run_pipeline(
             MAX_GRAPH_EXPANSION_ITERS,
         )
         extra_retriever = PaperRetriever(top_n=LOW_CONFIDENCE_EXTRA_TOP_N)
-        extra_papers = extra_retriever.retrieve(query, domain)
+        extra_papers = extra_retriever.retrieve(expanded_query, retrieval_domain)
         runtime_metrics["retrieved_papers"] += len(extra_papers)
         session.cache_papers(extra_papers)
 
         candidate_pool = session.get_cached_papers() if session.get_cached_papers() else filtered_papers
-        filtered_papers = paper_filter.filter(candidate_pool, query, top_k=max(top_k, FAST_MODE_TOP_K_PAPERS + 2))
+        filtered_papers = paper_filter.filter(
+            candidate_pool,
+            expanded_query,
+            intent=intent,
+            top_k=max(top_k, FAST_MODE_TOP_K_PAPERS + 2),
+        )
+        evidence_assessment = paper_filter.assess_evidence_consistency(expanded_query, filtered_papers)
 
         entities, relations = extractor.extract(
             filtered_papers,
-            question=query,
+            question=expanded_query,
             extraction_cache=session.extraction_cache,
             max_workers=ENTITY_EXTRACTION_MAX_WORKERS,
             runtime_metrics=runtime_metrics,
         )
         builder.add_entities(graph, entities)
         builder.add_relations(graph, relations)
+        builder.optimize_for_query(graph, expanded_query)
 
         retrieval = graph_retriever.retrieve(
-            query,
+            expanded_query,
             graph,
             enable_reasoning_controller=enable_reasoning,
             runtime_metrics=runtime_metrics,
@@ -268,6 +463,9 @@ def run_pipeline(
         subgraph=retrieval["subgraph"],
         reasoning_steps=retrieval.get("reasoning_steps", []),
         reasoning_paths=retrieval.get("reasoning_paths", []),
+        intent=intent,
+        evidence_assessment=evidence_assessment,
+        low_confidence_mode=low_confidence_mode,
         runtime_metrics=runtime_metrics,
     )
     logger.info("Answer generated successfully")
@@ -313,11 +511,16 @@ def run_pipeline(
         "confidence": float(retrieval.get("graph_confidence", 0.0)),
         # Extended details for app/evaluator compatibility
         "question": query,
+        "expanded_query": expanded_query,
         "domain": domain,
+        "subdomain": subdomain,
+        "intent": intent,
         "graph": graph,
         "filtered_papers": filtered_papers,
         "retrieval": retrieval,
         "answer_dict": answer_dict,
+        "evidence_assessment": evidence_assessment,
+        "low_confidence_mode": low_confidence_mode,
         "expansion_iters": expansion_iters,
         "retrieval_skips": retrieval_skips,
         "graph_confidence": retrieval.get("graph_confidence", 0.0),

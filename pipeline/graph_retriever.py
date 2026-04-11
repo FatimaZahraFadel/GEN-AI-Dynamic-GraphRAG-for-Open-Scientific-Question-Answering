@@ -26,6 +26,7 @@ logger = get_logger(__name__)
 
 _TOP_K_SEEDS = 5
 _HOP_DEPTH = 2
+_MIN_SEED_SIMILARITY = 0.20
 
 
 def compute_graph_confidence(graph: nx.DiGraph, seed_scores: Dict[str, float]) -> float:
@@ -146,11 +147,32 @@ class GraphRetriever:
         if enable_reasoning_controller:
             reasoning_paths = self.extract_ranked_paths(subgraph, seed_ids, seed_scores, top_k=5)
             reasoning_steps = self.build_reasoning_steps(question, graph, seed_scores)
+
+        validation = self.validate_subgraph(question, subgraph, reasoning_paths)
         context_text = self.subgraph_to_text(subgraph, reasoning_paths=reasoning_paths)
         graph_confidence = compute_graph_confidence(subgraph, seed_scores)
 
         if runtime_metrics is not None:
             runtime_metrics["seed_nodes"] = runtime_metrics.get("seed_nodes", 0) + len(seed_ids)
+
+        # Step 11 — consolidated diagnostic log
+        n_nodes = subgraph.number_of_nodes()
+        n_edges = subgraph.number_of_edges()
+        subgraph_density = n_edges / max(n_nodes * (n_nodes - 1), 1)
+        n_paths = len(reasoning_paths)
+        logger.info(
+            "[GraphRetriever diagnostics] seeds=%d | subgraph: nodes=%d edges=%d "
+            "density=%.4f | reasoning_paths=%d | graph_confidence=%.4f | "
+            "mean_relevance=%.4f | is_valid=%s",
+            len(seed_ids),
+            n_nodes,
+            n_edges,
+            subgraph_density,
+            n_paths,
+            graph_confidence,
+            validation.get("mean_relevance", 0.0),
+            validation.get("is_valid", False),
+        )
 
         return {
             "seed_entities": seed_ids,
@@ -160,20 +182,50 @@ class GraphRetriever:
             "reasoning_steps": reasoning_steps,
             "graph_confidence": graph_confidence,
             "context_text": context_text,
-            "num_nodes": subgraph.number_of_nodes(),
-            "num_edges": subgraph.number_of_edges(),
+            "num_nodes": n_nodes,
+            "num_edges": n_edges,
+            "validation": validation,
+            "needs_focus_expansion": not validation.get("is_valid", False),
         }
+
+    def _node_importance(self, graph: nx.DiGraph, nid: str) -> float:
+        """
+        Compute a normalised structural importance score for a node.
+
+        Combines in-degree, out-degree, and edge weights to produce a score
+        in [0, 1].  Nodes that are highly connected and connected via strong
+        edges score higher.  Domain-agnostic — uses graph topology only.
+        """
+        in_deg = graph.in_degree(nid)
+        out_deg = graph.out_degree(nid)
+        degree = in_deg + out_deg
+        if degree == 0:
+            return 0.0
+
+        # Sum of edge weights for incident edges
+        weight_sum = 0.0
+        for _, _, attrs in graph.in_edges(nid, data=True):
+            weight_sum += float(attrs.get("edge_weight", 1.0))
+        for _, _, attrs in graph.out_edges(nid, data=True):
+            weight_sum += float(attrs.get("edge_weight", 1.0))
+
+        avg_weight = weight_sum / max(degree, 1)
+        # Normalise degree by a soft cap (20 edges = full score)
+        degree_norm = min(degree / 20.0, 1.0)
+        return 0.5 * degree_norm + 0.5 * min(avg_weight, 1.0)
 
     def extract_seed_entities(
         self, question: str, graph: nx.DiGraph
     ) -> Tuple[List[str], Dict[str, float]]:
         """
-        Select the top-5 graph nodes most semantically similar to the question.
+        Step 8 — Hybrid seed selection: similarity + node importance.
 
-        The question and every node label are embedded with
-        ``all-MiniLM-L6-v2``.  Cosine similarity is computed between the
-        question embedding and each node's label embedding.  The top-5 node
-        IDs (by similarity) are returned as seed points for subgraph expansion.
+        Select the top-k graph nodes using a hybrid score:
+            hybrid_score = 0.70 * embedding_similarity + 0.30 * node_importance
+
+        This favours nodes that are both semantically close to the query AND
+        structurally central in the graph — producing more connected subgraphs.
+        No hardcoded domain keywords are used for boosting.
 
         Parameters
         ----------
@@ -184,8 +236,8 @@ class GraphRetriever:
 
         Returns
         -------
-        list[str]
-            Up to ``_TOP_K_SEEDS`` (5) node IDs ranked by descending similarity.
+        tuple[list[str], dict[str, float]]
+            Seed node IDs and their raw similarity scores.
         """
         if graph.number_of_nodes() == 0:
             logger.warning("extract_seed_entities: graph is empty — no seeds.")
@@ -222,27 +274,43 @@ class GraphRetriever:
             logger.warning("extract_seed_entities: node embeddings unavailable.")
             return [], {}
 
-        # Encode question + all labels in a single batch
         query_emb = self._embedding_service.encode_text(question)
         node_embs = np.vstack(node_embeddings)      # shape (n_nodes, dim)
 
         # Cosine similarity
         q_norm = query_emb / (np.linalg.norm(query_emb) + 1e-10)
         n_norms = node_embs / (np.linalg.norm(node_embs, axis=1, keepdims=True) + 1e-10)
-        scores = n_norms @ q_norm       # shape (n_nodes,)
+        sim_scores = n_norms @ q_norm               # shape (n_nodes,)
 
-        # Rank by score and keep top-k
+        # Step 8 — Hybrid score: similarity + structural importance
+        hybrid_scores = []
+        importance_scores = []
+        for i, nid in enumerate(node_ids):
+            imp = self._node_importance(graph, nid)
+            importance_scores.append(imp)
+            hybrid = 0.70 * float(sim_scores[i]) + 0.30 * imp
+            hybrid_scores.append(hybrid)
+
+        # Rank by hybrid score and keep top-k
         top_k = min(_TOP_K_SEEDS, len(node_ids))
-        ranked_indices = np.argsort(scores)[::-1][:top_k]
+        ranked_indices = np.argsort(np.asarray(hybrid_scores))[::-1][:top_k]
 
-        seed_ids = [node_ids[i] for i in ranked_indices]
-        seed_scores = {node_ids[i]: float(scores[i]) for i in ranked_indices}
+        filtered_ranked = [i for i in ranked_indices if float(sim_scores[i]) >= _MIN_SEED_SIMILARITY]
+        if not filtered_ranked:
+            filtered_ranked = list(ranked_indices)
 
-        logger.info("extract_seed_entities: top seeds selected:")
+        seed_ids = [node_ids[i] for i in filtered_ranked]
+        seed_scores = {node_ids[i]: float(sim_scores[i]) for i in filtered_ranked}
+
+        # Step 11 diagnostic logging
+        logger.info("extract_seed_entities (hybrid scoring): top seeds selected:")
         for i in ranked_indices:
             logger.info(
-                f"  score={scores[i]:.4f}  |  id={node_ids[i]}  "
-                f"label={graph.nodes[node_ids[i]].get('label', node_ids[i])}"
+                "  sim=%.4f  imp=%.4f  hybrid=%.4f  |  %s",
+                float(sim_scores[i]),
+                importance_scores[i],
+                hybrid_scores[i],
+                graph.nodes[node_ids[i]].get("label", node_ids[i]),
             )
 
         return seed_ids, seed_scores
@@ -298,7 +366,18 @@ class GraphRetriever:
         seed_scores: Dict[str, float],
         top_k: int = 5,
     ) -> List[Dict]:
-        """Extract and rank evidence paths between seed nodes."""
+        """
+        Step 9 — Multi-hop reasoning path extraction and ranking.
+
+        Extracts paths of length ≥ 2 between seed pairs and ranks them by a
+        composite score:
+            score = 0.25 * length_score       (prefer longer paths — more reasoning)
+                  + 0.35 * node_relevance      (average seed similarity along path)
+                  + 0.25 * edge_weight_score   (average edge weight along path)
+                  + 0.15 * paper_freq_score    (multi-paper evidence support)
+
+        No hardcoded domain terms — ranking is fully query and graph-driven.
+        """
         if subgraph.number_of_nodes() == 0:
             return []
 
@@ -306,7 +385,7 @@ class GraphRetriever:
         candidates: List[Dict] = []
         usable_seeds = [s for s in seed_ids if s in undirected]
 
-        for src, dst in combinations(usable_seeds[:5], 2):
+        for src, dst in combinations(usable_seeds[:6], 2):
             if not nx.has_path(undirected, src, dst):
                 continue
             try:
@@ -314,23 +393,38 @@ class GraphRetriever:
             except nx.NetworkXNoPath:
                 continue
 
-            if len(path) < 2 or len(path) > 6:
+            if len(path) < 3 or len(path) > 5:
                 continue
 
-            edge_scores: List[float] = []
-            paper_ids = set()
+            edge_weights: List[float] = []
+            node_sims: List[float] = []
+            paper_ids: set = set()
+
+            for node in path:
+                node_sims.append(seed_scores.get(node, 0.0))
+
             for a, b in zip(path[:-1], path[1:]):
                 edge_data = subgraph.get_edge_data(a, b) or subgraph.get_edge_data(b, a) or {}
-                rel_score = (seed_scores.get(a, 0.0) + seed_scores.get(b, 0.0)) / 2.0
-                edge_scores.append(rel_score)
-                pid = edge_data.get("source_paper_id")
-                if pid:
+                edge_weights.append(float(edge_data.get("edge_weight", 1.0)))
+                pid = edge_data.get("source_paper_id", "")
+                if pid and pid not in ("semantic_bridge", "cooccurrence"):
                     paper_ids.add(pid)
 
-            length_score = 1.0 / float(len(path))
-            edge_relevance = float(np.mean(edge_scores)) if edge_scores else 0.0
-            freq_score = min(len(paper_ids) / max(len(path) - 1, 1), 1.0)
-            total = (0.30 * length_score) + (0.45 * ((edge_relevance + 1.0) / 2.0)) + (0.25 * freq_score)
+            # Prefer longer paths (more reasoning hops = richer explanation)
+            length_score = min((len(path) - 1) / 4.0, 1.0)  # cap at 4 hops
+            # Normalise mean similarity from [-1,1] → [0,1]
+            node_relevance = (float(np.mean(node_sims)) + 1.0) / 2.0
+            # Average edge weight (already in [0,1] range)
+            edge_weight_score = float(np.mean(edge_weights)) if edge_weights else 0.5
+            # Paper support: reward paths evidenced by multiple real papers
+            paper_freq_score = min(len(paper_ids) / max(len(path) - 1, 1), 1.0)
+
+            total = (
+                0.25 * length_score
+                + 0.35 * node_relevance
+                + 0.25 * edge_weight_score
+                + 0.15 * paper_freq_score
+            )
 
             label_path = [subgraph.nodes[n].get("label", n) for n in path]
             candidates.append(
@@ -340,10 +434,47 @@ class GraphRetriever:
                     "score": float(total),
                     "length": len(path),
                     "paper_frequency": len(paper_ids),
+                    "edge_weight_avg": round(edge_weight_score, 4),
+                    "node_relevance_avg": round(node_relevance, 4),
                 }
             )
 
+        # Fallback: allow 1-hop evidence if no multi-hop path exists.
+        if not candidates:
+            for src, dst in combinations(usable_seeds[:5], 2):
+                if not nx.has_path(undirected, src, dst):
+                    continue
+                try:
+                    path = nx.shortest_path(undirected, source=src, target=dst)
+                except nx.NetworkXNoPath:
+                    continue
+                if len(path) != 2:
+                    continue
+                label_path = [subgraph.nodes[n].get("label", n) for n in path]
+                candidates.append(
+                    {
+                        "nodes": path,
+                        "labels": label_path,
+                        "score": 0.2,
+                        "length": len(path),
+                        "paper_frequency": 0,
+                        "edge_weight_avg": 0.5,
+                        "node_relevance_avg": 0.5,
+                    }
+                )
+
         candidates.sort(key=lambda x: x["score"], reverse=True)
+
+        if candidates:
+            logger.info(
+                "extract_ranked_paths: %d candidates — top path score=%.4f, "
+                "length=%d, paper_freq=%d",
+                len(candidates),
+                candidates[0]["score"],
+                candidates[0]["length"],
+                candidates[0]["paper_frequency"],
+            )
+
         return candidates[:top_k]
 
     def retrieve_subgraph(
@@ -382,11 +513,83 @@ class GraphRetriever:
             )
             return graph.copy()
 
+        # Expand one more hop for isolated seed nodes so context stays connected.
+        isolated_seed_count = 0
+        for seed in seed_entity_ids:
+            if seed in subgraph and subgraph.degree(seed) == 0:
+                isolated_seed_count += 1
+        if isolated_seed_count > 0:
+            subgraph = self._graph_builder.get_subgraph(graph, seed_entity_ids, depth + 1)
+
         logger.info(
             f"retrieve_subgraph: {subgraph.number_of_nodes()} nodes, "
             f"{subgraph.number_of_edges()} edges retrieved."
         )
         return subgraph
+
+    def validate_subgraph(
+        self,
+        question: str,
+        subgraph: nx.DiGraph,
+        reasoning_paths: List[Dict],
+    ) -> Dict:
+        """
+        Step 10 — Context quality validation (domain-agnostic).
+
+        Checks:
+        1. Minimum node count (≥ 3 nodes).
+        2. Minimum edge count (≥ 2 edges) — ensures meaningful paths exist.
+        3. At least one multi-hop reasoning path (length ≥ 3).
+        4. Embedding-based relevance: the mean cosine similarity between the
+           question and node labels must exceed a minimum threshold.
+
+        If any check fails, ``is_valid=False`` signals the pipeline to trigger
+        a fallback (extra retrieval pass or abstract supplementation).
+
+        No hardcoded domain terms — all checks are structural or embedding-based.
+        """
+        num_nodes = subgraph.number_of_nodes()
+        num_edges = subgraph.number_of_edges()
+
+        has_multihop = any(int(p.get("length", 0)) >= 3 for p in reasoning_paths)
+
+        # Embedding-based relevance check
+        mean_relevance = 0.0
+        if num_nodes > 0:
+            labels = [
+                attrs.get("label", nid)
+                for nid, attrs in subgraph.nodes(data=True)
+            ]
+            q_emb = self._embedding_service.encode_text(question)
+            node_embs = self._embedding_service.encode_batch(labels)
+            q_norm = q_emb / (np.linalg.norm(q_emb) + 1e-10)
+            n_norms = node_embs / (np.linalg.norm(node_embs, axis=1, keepdims=True) + 1e-10)
+            sims = n_norms @ q_norm
+            mean_relevance = float(np.mean(sims))
+
+        checks = {
+            "has_min_nodes": num_nodes >= 3,
+            "has_min_edges": num_edges >= 2,
+            "has_multihop_paths": has_multihop,
+            "mean_relevance_ok": mean_relevance >= 0.20,
+        }
+        is_valid = all(checks.values())
+
+        logger.info(
+            "validate_subgraph: nodes=%d edges=%d multihop=%s "
+            "mean_relevance=%.4f is_valid=%s",
+            num_nodes, num_edges, has_multihop, mean_relevance, is_valid,
+        )
+
+        return {
+            "question": question,
+            "num_nodes": num_nodes,
+            "num_edges": num_edges,
+            "has_multihop_paths": has_multihop,
+            "mean_relevance": round(mean_relevance, 4),
+            "checks": checks,
+            "is_valid": is_valid,
+        }
 
     def subgraph_to_text(self, subgraph: nx.DiGraph, reasoning_paths: List[Dict] | None = None) -> str:
         """

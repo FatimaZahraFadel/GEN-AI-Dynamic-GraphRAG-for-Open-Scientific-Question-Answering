@@ -4,15 +4,22 @@ Stage 2 — Paper Retriever: fetch candidate papers from external academic APIs.
 Primary source  : Europe PMC API (free, no auth required, good agricultural coverage)
 Secondary source: arXiv API (free preprints, good for cutting-edge research)
 Fallback source : OpenAlex API (used when others return no results)
+
+Upgrades
+--------
+- Step 1: LLM-based query expansion (domain-agnostic, via Groq)
+- Step 2: Dual retrieval (original + expanded query) with deduplication
 """
 
 import os
+import re
 import time
-from typing import List
+from typing import List, Optional
 import xml.etree.ElementTree as ET
 
 import requests
 from dotenv import load_dotenv
+from groq import Groq
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
 
@@ -56,17 +63,23 @@ class PaperRetriever:
     """
     Retrieves scientific papers from Europe PMC, arXiv, and OpenAlex.
 
-    The :meth:`retrieve` method is the main entry point.  It builds a clean
-    search query from the user's question and domain, then uses a domain-aware
-    source priority to retrieve papers.
+    The :meth:`retrieve` method is the main entry point.  It optionally
+    expands the query with an LLM (Step 1), retrieves papers for both the
+    original and expanded queries (Step 2 — dual retrieval), and deduplicates.
 
     Attributes
     ----------
     top_n : int
-        Maximum number of papers to request from each API.
+        Maximum number of papers to request from each API per query.
+    use_query_expansion : bool
+        If True, use Groq LLM to expand the query before retrieval.
     """
 
-    def __init__(self, top_n: int = TOP_N_PAPERS) -> None:
+    def __init__(
+        self,
+        top_n: int = TOP_N_PAPERS,
+        use_query_expansion: bool = True,
+    ) -> None:
         """
         Initialise the retriever.
 
@@ -75,10 +88,14 @@ class PaperRetriever:
         top_n : int
             Maximum papers to retrieve per source. Defaults to
             ``config.settings.TOP_N_PAPERS``.
+        use_query_expansion : bool
+            Whether to use LLM-based query expansion. Defaults to True.
         """
         self.top_n = top_n
+        self.use_query_expansion = use_query_expansion
         self.retrieved_papers_count: int = 0
         self._session = requests.Session()
+        self._groq_client: Optional[Groq] = None
 
         retry = Retry(
             total=_MAX_RETRIES,
@@ -103,6 +120,87 @@ class PaperRetriever:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def _anchor_terms(self, question: str) -> List[str]:
+        """Extract important non-stopword anchors from the original question."""
+        tokens = re.findall(r"\b[a-z0-9\-]{4,}\b", (question or "").lower())
+        anchors: List[str] = []
+        for tok in tokens:
+            if tok in _STOP_WORDS:
+                continue
+            if tok not in anchors:
+                anchors.append(tok)
+        return anchors[:10]
+
+    def _is_expansion_anchored(self, question: str, expanded: str) -> bool:
+        """Return True when expanded query preserves enough original anchors."""
+        anchors = self._anchor_terms(question)
+        if not anchors:
+            return True
+        exp_l = (expanded or "").lower()
+        overlap = sum(1 for a in anchors if a in exp_l)
+        return overlap / max(len(anchors), 1) >= 0.5
+
+    def expand_query(self, question: str) -> str:
+        """
+        Step 1 — LLM-based query expansion (domain-agnostic).
+
+        Sends the question to the Groq LLM with a general-purpose prompt that
+        asks for key concepts, related terms, synonyms, and implicit subtopics.
+        Returns only the expanded query string.  Falls back to the original
+        question if the LLM call fails.
+
+        Parameters
+        ----------
+        question : str
+            Original natural-language user question.
+
+        Returns
+        -------
+        str
+            Dense, expanded query string for retrieval.
+        """
+        try:
+            client = self._get_groq_client()
+            prompt = (
+                "Expand the following question into a dense search query for "
+                "academic paper retrieval. Include:\n"
+                "- key concepts and entities\n"
+                "- related technical terms\n"
+                "- possible synonyms and alternative phrasings\n"
+                "- implicit subtopics that papers addressing this question would cover\n\n"
+                "Constraints:\n"
+                "- Preserve original domain intent and core entities.\n"
+                "- Do NOT shift topic to adjacent fields unless explicitly requested.\n"
+                "- Keep wording aligned with the original problem statement.\n\n"
+                "Return ONLY a short expanded query (2-3 lines max). "
+                "No explanation, no bullet points, no preamble.\n\n"
+                f"Question: {question}"
+            )
+            response = client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+                max_tokens=120,
+            )
+            expanded = response.choices[0].message.content.strip()
+            if not self._is_expansion_anchored(question, expanded):
+                logger.warning("Query expansion drift detected; falling back to original query.")
+                return question
+            logger.info("Query expansion: '%s' → '%s'", question[:60], expanded[:100])
+            return expanded
+        except Exception as e:
+            logger.warning("Query expansion failed (%s); using original query.", e)
+            return question
+
+    def _get_groq_client(self) -> Groq:
+        """Return cached Groq client, creating it on first call."""
+        if self._groq_client is None:
+            api_key = os.getenv("GROQ_API_KEY")
+            if not api_key:
+                raise EnvironmentError("GROQ_API_KEY is not set.")
+            self._groq_client = Groq(api_key=api_key)
+        return self._groq_client
 
     def get_source_priority(self, domain: str, question: str) -> List[str]:
         """
@@ -147,13 +245,17 @@ class PaperRetriever:
         # Default robust route.
         return ["europe_pmc", "arxiv", "openalex"]
 
-    def retrieve(self, question: str, domain: str) -> List[Paper]:
+    def retrieve(self, question: str, domain: str, expanded_question: Optional[str] = None) -> List[Paper]:
         """
         Main entry point: retrieve papers relevant to the question and domain.
 
-        Builds a search query with :meth:`build_query`, then chooses source
-        order via :meth:`get_source_priority` and tries each source until one
-        returns results.
+        Steps
+        -----
+        1. Optionally expand the query with the LLM (Step 1).
+        2. Build API search strings for both original and expanded queries.
+        3. Fetch papers for each query from the priority-ordered sources
+           (Step 2 — dual retrieval).
+        4. Merge and deduplicate by paper ID / title.
 
         Parameters
         ----------
@@ -165,10 +267,16 @@ class PaperRetriever:
         Returns
         -------
         list[Paper]
-            Retrieved papers, up to ``self.top_n`` entries.
+            Retrieved papers, deduplicated, up to ``2 * self.top_n`` entries.
         """
-        query = self.build_query(question, domain)
-        logger.info(f"Built search query: '{query}'")
+        # Step 1 — LLM query expansion
+        if expanded_question is None:
+            expanded_question = self.expand_query(question) if self.use_query_expansion else question
+
+        query_original = self.build_query(question, domain)
+        query_expanded = self.build_query(expanded_question, domain)
+        logger.info("Original search query : '%s'", query_original)
+        logger.info("Expanded search query : '%s'", query_expanded[:120])
 
         source_priority = self.get_source_priority(domain, question)
         logger.info(
@@ -188,28 +296,59 @@ class PaperRetriever:
             "openalex": "OpenAlex",
         }
 
-        for source_key in source_priority:
-            fetcher = fetchers.get(source_key)
-            if fetcher is None:
-                continue
+        # Step 2 — Dual retrieval: try original query first, then expanded
+        all_papers: List[Paper] = []
+        seen_ids: set = set()
 
-            papers = fetcher(query)
-            if papers:
-                self.retrieved_papers_count += len(papers)
-                logger.info(
-                    "Using %s (%d papers retrieved).",
+        def _fetch_and_merge(query: str, label: str) -> None:
+            """Fetch from priority sources and merge into all_papers."""
+            any_source_succeeded = False
+            for source_key in source_priority:
+                fetcher = fetchers.get(source_key)
+                if fetcher is None:
+                    continue
+                papers = fetcher(query)
+                if papers:
+                    any_source_succeeded = True
+                    added = 0
+                    for p in papers:
+                        dedup_key = p.paper_id or p.title.lower().strip()
+                        if dedup_key and dedup_key not in seen_ids:
+                            seen_ids.add(dedup_key)
+                            all_papers.append(p)
+                            added += 1
+                    logger.info(
+                        "[%s / %s] %d new papers added (%d total).",
+                        label,
+                        source_labels.get(source_key, source_key),
+                        added,
+                        len(all_papers),
+                    )
+                    continue
+                logger.warning(
+                    "[%s] %s returned no results.",
+                    label,
                     source_labels.get(source_key, source_key),
-                    len(papers),
                 )
-                return papers
+            if not any_source_succeeded:
+                logger.warning("[%s] no sources returned results for query.", label)
 
-            logger.warning(
-                "%s returned no results. Trying next source.",
-                source_labels.get(source_key, source_key),
-            )
+        _fetch_and_merge(query_original, "original")
 
-        logger.warning("All sources returned no results for query: '%s'", query)
-        return []
+        # Only run expanded query if it differs meaningfully from the original
+        if query_expanded.strip() != query_original.strip():
+            _fetch_and_merge(query_expanded, "expanded")
+
+        self.retrieved_papers_count += len(all_papers)
+        logger.info(
+            "Dual retrieval complete: %d deduplicated papers (original + expanded).",
+            len(all_papers),
+        )
+
+        if not all_papers:
+            logger.warning("All sources returned no results for query: '%s'", query_original)
+
+        return all_papers
 
     def build_query(self, question: str, domain: str) -> str:
         """
@@ -457,7 +596,19 @@ class PaperRetriever:
             Parsed papers; entries with missing titles are skipped.
         """
         papers: List[Paper] = []
-        for item in data.get("resultList", []):
+
+        # Europe PMC may return resultList as {"result": [...]}.
+        result_list = data.get("resultList", {}) if isinstance(data, dict) else {}
+        if isinstance(result_list, dict):
+            raw_items = result_list.get("result", [])
+        elif isinstance(result_list, list):
+            raw_items = result_list
+        else:
+            raw_items = []
+
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
             title = (item.get("title") or "").strip()
             if not title:
                 continue
@@ -468,10 +619,19 @@ class PaperRetriever:
             if not abstract:
                 continue
 
-            authors = [
-                a.get("fullName", "") 
-                for a in (item.get("authorList", {}).get("author") or [])
-            ]
+            author_list = item.get("authorList", {})
+            author_items = []
+            if isinstance(author_list, dict):
+                author_items = author_list.get("author", []) or []
+            elif isinstance(author_list, list):
+                author_items = author_list
+
+            authors = []
+            for a in author_items:
+                if isinstance(a, dict):
+                    name = (a.get("fullName") or "").strip()
+                    if name:
+                        authors.append(name)
 
             papers.append(Paper(
                 paper_id=item.get("pmid") or item.get("id") or "",

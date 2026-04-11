@@ -30,6 +30,15 @@ logger = get_logger(__name__)
 
 _MAX_PAPERS = 5
 _ABSTRACT_TRUNCATE = 300
+_INTENT_MIN_ITEMS = {
+    "solution": 6,
+    "list": 6,
+    "comparison": 4,
+    "process": 4,
+    "cause": 4,
+    "explanation": 4,
+    "fact": 4,
+}
 
 
 class AnswerGenerator:
@@ -82,6 +91,9 @@ class AnswerGenerator:
         subgraph: Optional[nx.DiGraph] = None,
         reasoning_steps: Optional[List[str]] = None,
         reasoning_paths: Optional[List[Dict]] = None,
+        intent: str = "fact",
+        evidence_assessment: Optional[Dict] = None,
+        low_confidence_mode: bool = False,
         runtime_metrics: Optional[Dict[str, float]] = None,
     ) -> Dict:
         """
@@ -132,10 +144,31 @@ class AnswerGenerator:
             papers,
             reasoning_steps=reasoning_steps or [],
             reasoning_paths=reasoning_paths or [],
+            intent=intent,
+            evidence_assessment=evidence_assessment or {},
+            low_confidence_mode=low_confidence_mode,
         )
         if runtime_metrics is not None:
             runtime_metrics["llm_calls"] = runtime_metrics.get("llm_calls", 0) + 1
         answer = self._call_llm(prompt)
+
+        quality_issues = self._detect_quality_issues(answer, intent=intent, question=question)
+        if quality_issues:
+            logger.warning(
+                "Answer quality gate triggered: %s. Running repair pass.",
+                "; ".join(quality_issues),
+            )
+            repair_prompt = self._build_repair_prompt(
+                question=question,
+                intent=intent,
+                initial_answer=answer,
+                quality_issues=quality_issues,
+                context_text=context_text,
+                papers=selected_papers,
+            )
+            if runtime_metrics is not None:
+                runtime_metrics["llm_calls"] = runtime_metrics.get("llm_calls", 0) + 1
+            answer = self._call_llm(repair_prompt)
 
         num_papers = min(len(papers), _MAX_PAPERS)
         logger.info(
@@ -158,6 +191,9 @@ class AnswerGenerator:
         papers: List[Paper],
         reasoning_steps: List[str] | None = None,
         reasoning_paths: List[Dict] | None = None,
+        intent: str = "fact",
+        evidence_assessment: Dict | None = None,
+        low_confidence_mode: bool = False,
     ) -> str:
         """
         Assemble the full RAG prompt for the LLM.
@@ -185,6 +221,7 @@ class AnswerGenerator:
         """
         reasoning_steps = reasoning_steps or []
         reasoning_paths = reasoning_paths or []
+        evidence_assessment = evidence_assessment or {}
 
         context_text = self._select_top_context_triples(
             question=question,
@@ -209,6 +246,7 @@ class AnswerGenerator:
 
         # Build the paper evidence block
         selected_papers = papers[:_MAX_PAPERS]
+        evidence_terms = self._extract_candidate_terms(question, selected_papers)
         paper_lines: List[str] = []
         for i, paper in enumerate(selected_papers, 1):
             abstract_snippet = truncate_text(
@@ -223,23 +261,48 @@ class AnswerGenerator:
                 f"    Abstract: {abstract_snippet}"
             )
         papers_block = "\n\n".join(paper_lines) if paper_lines else "No papers available."
+        evidence_terms_block = ", ".join(evidence_terms[:12]) if evidence_terms else "None detected from titles/abstracts."
+        evidence_diag_block = (
+            f"consistency_score={evidence_assessment.get('consistency_score', 0.0)}; "
+            f"is_consistent={evidence_assessment.get('is_consistent', False)}; "
+            f"avg_pairwise_overlap={evidence_assessment.get('avg_pairwise_overlap', 0.0)}"
+        )
+        confidence_instruction = ""
+        if low_confidence_mode:
+            confidence_instruction = (
+                "- Confidence is low. Use cautious language, separate strong vs weak evidence, "
+                "and explicitly list uncertainties.\n"
+            )
+        effective_mode = self._infer_effective_mode(intent=intent, question=question)
+        min_items = _INTENT_MIN_ITEMS.get(effective_mode, _INTENT_MIN_ITEMS.get(intent, 4))
+        intent_instruction = self._build_intent_instruction(intent=effective_mode, min_items=min_items)
 
         prompt = f"""You are a scientific question-answering assistant.
 
 Your task is to answer the question below using ONLY the information provided in the Graph Context and Supporting Papers sections. Do not use any outside knowledge or make speculative claims.
 
 Instructions:
-- Synthesize and organize information into logical groups or categories (e.g., by disease type, affected crops, environmental factors, management strategies).
-- Write in a narrative style that flows naturally—avoid mechanical enumeration of graph relationships.
-- Do NOT repeat the same relationship type (e.g., "leads to", "affects") multiple times. Instead, group related entities together (e.g., "Rust, stripe rust, and black mold are all diseases that affect wheat in humid conditions" rather than listing each one separately with "leads to" or "affects").
-- Prioritize clarity and readability over exhaustively listing every graph edge.
+- Answer immediately with the direct answer; do not start with generic intro text.
+- Organize output using clear section headings and bullet points.
+- Keep every item concrete and actionable; avoid vague advice.
 - Cite supporting papers using the format [Paper: <title>] when you draw from them.
-- If the context does not contain enough information to answer fully, state what is known and acknowledge the limitation.
+- Prefer terms that appear in Graph Context, Candidate Evidence Terms, or Supporting Papers; do not invent entities.
+- Remove duplicates and weak graph nodes; keep only clear, relevant concepts.
 - Do not speculate beyond what the context supports.
-- Output must follow this structure exactly:
-    Step 1: ...
-    Step 2: ...
-    Conclusion: ...
+{intent_instruction}{confidence_instruction}- Include trade-offs or common mistakes where helpful.
+- End with: Practical Optimization Workflow (3-5 concise steps) when relevant.
+
+Output format:
+- Direct Answer:
+    - ...
+- Category 1:
+    - Technique -> What it is. When to use it. (optionally trade-off)
+- Category 2:
+    - Technique -> What it is. When to use it. (optionally trade-off)
+- Practical Optimization Workflow:
+    1. ...
+    2. ...
+    3. ...
 
 ---
 QUESTION:
@@ -252,6 +315,14 @@ REASONING CHAIN (controller guidance):
 ---
 GRAPH CONTEXT (knowledge graph triples extracted from scientific literature):
 {context_text}
+
+---
+CANDIDATE EVIDENCE TERMS (auto-mined from evidence text):
+{evidence_terms_block}
+
+---
+EVIDENCE DIAGNOSTICS:
+{evidence_diag_block}
 
 ---
 SUPPORTING PAPERS:
@@ -299,6 +370,147 @@ ANSWER:"""
                 continue
             out.append(line)
         return "\n".join(out)
+
+    def _extract_candidate_terms(self, question: str, papers: List[Paper]) -> List[str]:
+        """Extract question-aligned evidence terms from paper titles/abstracts."""
+        q_tokens = set(re.findall(r"\b[a-z]{4,}\b", (question or "").lower()))
+        stop = {
+            "what", "which", "when", "where", "does", "that", "this",
+            "from", "with", "into", "about", "their", "there", "these",
+        }
+        q_tokens = {t for t in q_tokens if t not in stop}
+        if not q_tokens:
+            return []
+
+        mentions: Dict[str, int] = {}
+        for paper in papers:
+            text = f"{paper.title}. {paper.abstract or ''}"
+            tokens = re.findall(r"\b[a-z][a-z\-]{3,}\b", text.lower())
+            for tok in tokens:
+                if tok in q_tokens:
+                    mentions[tok] = mentions.get(tok, 0) + 1
+
+        ranked = sorted(mentions.items(), key=lambda x: (-x[1], x[0]))
+        return [name for name, _ in ranked]
+
+    def _build_intent_instruction(self, intent: str, min_items: int) -> str:
+        """Build intent-specific output requirements for stronger answer quality."""
+        if intent == "solution":
+            return (
+                f"- This is a solution question. Provide at least {min_items} concrete techniques.\\n"
+                "- Group techniques into categories (model-level, training, data, hyperparameter tuning).\\n"
+                "- For each technique include: what it is (1 sentence) and when to use it (1 sentence).\\n"
+                "- Do not repeat the same concept with different wording.\\n"
+            )
+        if intent == "comparison":
+            return (
+                f"- This is a comparison question. Provide at least {min_items} compared items.\\n"
+                "- For each item include key difference and trade-off.\\n"
+            )
+        if intent in {"process", "cause", "explanation"}:
+            return (
+                f"- Provide at least {min_items} core points and connect cause-effect or mechanism clearly.\\n"
+            )
+        if intent == "list":
+            return (
+                f"- This is a list question. Provide at least {min_items} non-duplicate items.\\n"
+            )
+        return (
+            f"- Provide at least {min_items} concrete points if the question asks for multiple methods/issues.\\n"
+        )
+
+    def _infer_effective_mode(self, intent: str, question: str) -> str:
+        """Infer stronger answer mode from question wording when needed."""
+        q = (question or "").lower()
+
+        list_signals = [
+            "what are", "list", "techniques", "methods", "strategies", "approaches",
+            "best practices", "ways to", "how to optimize", "optimization techniques",
+        ]
+        solution_signals = [
+            "fix", "improve", "optimize", "reduce", "mitigate", "enhance",
+        ]
+
+        if any(sig in q for sig in list_signals):
+            if any(sig in q for sig in solution_signals):
+                return "solution"
+            return "list"
+
+        if intent in _INTENT_MIN_ITEMS:
+            return intent
+        return "fact"
+
+    def _count_list_items(self, text: str) -> int:
+        """Count bullet/numbered list items in generated answer."""
+        lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+        item_re = re.compile(r"^(?:[-*]|\d+[.)])\s+")
+        arrow_re = re.compile(r"^[A-Za-z].*->")
+        return sum(1 for ln in lines if item_re.match(ln) or arrow_re.match(ln))
+
+    def _detect_quality_issues(self, answer: str, intent: str, question: str) -> List[str]:
+        """Return human-readable quality violations for auto-repair."""
+        issues: List[str] = []
+        text = (answer or "").strip()
+        if not text:
+            return ["empty_answer"]
+
+        effective_mode = self._infer_effective_mode(intent=intent, question=question)
+        min_items = _INTENT_MIN_ITEMS.get(effective_mode, 4)
+        item_count = self._count_list_items(text)
+        if effective_mode in {"solution", "list", "comparison", "process", "cause", "explanation"} and item_count < min_items:
+            issues.append(f"insufficient_items:{item_count}<{min_items}")
+
+        lower = text.lower()
+        if effective_mode in {"solution", "list"}:
+            if "practical optimization workflow" not in lower:
+                issues.append("missing_workflow_section")
+            category_markers = ["model", "training", "data", "hyperparameter"]
+            if sum(1 for m in category_markers if m in lower) < 2:
+                issues.append("missing_category_structure")
+
+        if len(text) < 500:
+            issues.append("too_short")
+
+        return issues
+
+    def _build_repair_prompt(
+        self,
+        question: str,
+        intent: str,
+        initial_answer: str,
+        quality_issues: List[str],
+        context_text: str,
+        papers: List[Paper],
+    ) -> str:
+        """Build a strict rewrite prompt to repair low-quality drafts."""
+        min_items = _INTENT_MIN_ITEMS.get(intent, 4)
+        paper_titles = "\n".join(f"- {p.title}" for p in papers[:_MAX_PAPERS]) or "- None"
+        return f"""Rewrite the draft answer to satisfy all constraints exactly.
+
+Question: {question}
+Intent: {intent}
+Detected quality issues: {', '.join(quality_issues)}
+
+Hard constraints:
+- Provide at least {min_items} concrete items.
+- Use clear category headings and bullet points.
+- For each item include: what it is + when to use it.
+- Include practical trade-offs/common mistakes briefly.
+- Keep grounded to provided graph context and papers; no unsupported claims.
+- Avoid duplicate concepts.
+- End with section title exactly: Practical Optimization Workflow
+- Under that section include 3-5 numbered steps.
+
+Graph Context:
+{context_text}
+
+Supporting Papers:
+{paper_titles}
+
+Draft answer to improve:
+{initial_answer}
+
+Return only the improved final answer."""
 
     def format_answer(self, answer_dict: Dict) -> str:
         """
