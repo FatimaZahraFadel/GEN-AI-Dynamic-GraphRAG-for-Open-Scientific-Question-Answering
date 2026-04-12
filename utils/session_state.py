@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -17,6 +18,11 @@ from config.settings import (
 from models.graph_node import Entity, Relation
 from models.paper import Paper
 
+# Max entries kept in bounded session caches.  Prevents unbounded memory growth
+# during long-running Streamlit sessions with many queries.
+_MAX_PAPERS_CACHE = 500
+_MAX_EXTRACTION_CACHE = 300
+
 
 @dataclass
 class SessionState:
@@ -24,8 +30,9 @@ class SessionState:
 
     domain: Optional[str] = None
     graph: Optional[nx.DiGraph] = None
-    papers_by_id: Dict[str, Paper] = field(default_factory=dict)
-    extraction_cache: Dict[str, Tuple[List[Entity], List[Relation]]] = field(default_factory=dict)
+    # OrderedDict gives FIFO eviction when max size is reached.
+    papers_by_id: OrderedDict = field(default_factory=OrderedDict)
+    extraction_cache: OrderedDict = field(default_factory=OrderedDict)
     query_embeddings: List[np.ndarray] = field(default_factory=list)
     query_texts: List[str] = field(default_factory=list)
     query_timestamps: List[float] = field(default_factory=list)
@@ -65,11 +72,32 @@ class SessionState:
         self.query_timestamps.append(time.time())
 
     def cache_papers(self, papers: List[Paper]) -> None:
-        """Upsert papers into the paper cache by ``paper_id``."""
+        """Upsert papers into the bounded paper cache by ``paper_id``."""
         for paper in papers:
             if paper.paper_id:
+                # Move to end (most-recently-used) if already present.
+                self.papers_by_id.pop(paper.paper_id, None)
                 self.papers_by_id[paper.paper_id] = paper
+                if len(self.papers_by_id) > _MAX_PAPERS_CACHE:
+                    self.papers_by_id.popitem(last=False)
 
     def get_cached_papers(self) -> List[Paper]:
         """Return all cached papers as a list."""
         return list(self.papers_by_id.values())
+
+    def cache_extraction(
+        self,
+        key: str,
+        value: Tuple[List[Entity], List[Relation]],
+    ) -> None:
+        """Insert an extraction result into the bounded extraction cache."""
+        self.extraction_cache.pop(key, None)
+        self.extraction_cache[key] = value
+        if len(self.extraction_cache) > _MAX_EXTRACTION_CACHE:
+            self.extraction_cache.popitem(last=False)
+
+    def get_extraction(
+        self, key: str
+    ) -> Optional[Tuple[List[Entity], List[Relation]]]:
+        """Retrieve a cached extraction result, or None if not present."""
+        return self.extraction_cache.get(key)

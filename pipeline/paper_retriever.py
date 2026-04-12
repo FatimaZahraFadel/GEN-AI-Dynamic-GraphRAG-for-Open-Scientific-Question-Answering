@@ -14,6 +14,8 @@ Upgrades
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 from typing import List, Optional
 import xml.etree.ElementTree as ET
 
@@ -96,6 +98,8 @@ class PaperRetriever:
         self.retrieved_papers_count: int = 0
         self._session = requests.Session()
         self._groq_client: Optional[Groq] = None
+        self._query_expansion_cache: dict[str, str] = {}
+        self._query_expansion_lock = Lock()
 
         retry = Retry(
             total=_MAX_RETRIES,
@@ -160,6 +164,13 @@ class PaperRetriever:
         str
             Dense, expanded query string for retrieval.
         """
+        cache_key = question.strip().lower()
+        with self._query_expansion_lock:
+            cached = self._query_expansion_cache.get(cache_key)
+        if cached is not None:
+            logger.info("Query expansion cache hit for question '%s'", question[:60])
+            return cached
+
         try:
             client = self._get_groq_client()
             prompt = (
@@ -186,11 +197,15 @@ class PaperRetriever:
             expanded = response.choices[0].message.content.strip()
             if not self._is_expansion_anchored(question, expanded):
                 logger.warning("Query expansion drift detected; falling back to original query.")
-                return question
+                expanded = question
             logger.info("Query expansion: '%s' → '%s'", question[:60], expanded[:100])
+            with self._query_expansion_lock:
+                self._query_expansion_cache[cache_key] = expanded
             return expanded
         except Exception as e:
             logger.warning("Query expansion failed (%s); using original query.", e)
+            with self._query_expansion_lock:
+                self._query_expansion_cache[cache_key] = question
             return question
 
     def _get_groq_client(self) -> Groq:
@@ -239,8 +254,9 @@ class PaperRetriever:
 
         if any(k in text for k in [
             "geoscience", "earthquake", "tectonic", "climate", "soil",
+            "lithium", "mining", "mineral", "geology", "extraction", "geothermal",
         ]):
-            return ["europe_pmc", "arxiv", "openalex"]
+            return ["europe_pmc", "openalex", "arxiv"]
 
         # Default robust route.
         return ["europe_pmc", "arxiv", "openalex"]
@@ -296,20 +312,38 @@ class PaperRetriever:
             "openalex": "OpenAlex",
         }
 
-        # Step 2 — Dual retrieval: try original query first, then expanded
+        # Step 2 — Parallel dual retrieval: fire all (source, query) pairs concurrently.
+        # Build task list: original query for each source, then expanded if different.
+        tasks: List[tuple] = []
+        for source_key in source_priority:
+            tasks.append((source_key, query_original, "original"))
+        if query_expanded.strip() != query_original.strip():
+            for source_key in source_priority:
+                tasks.append((source_key, query_expanded, "expanded"))
+
+        def _fetch_task(source_key: str, query: str, label: str) -> tuple:
+            fetcher = fetchers.get(source_key)
+            if fetcher is None:
+                return (source_key, label, [])
+            try:
+                papers = fetcher(query)
+                return (source_key, label, papers or [])
+            except Exception as exc:
+                logger.warning("Fetch error [%s / %s]: %s", label, source_key, exc)
+                return (source_key, label, [])
+
         all_papers: List[Paper] = []
         seen_ids: set = set()
 
-        def _fetch_and_merge(query: str, label: str) -> None:
-            """Fetch from priority sources and merge into all_papers."""
-            any_source_succeeded = False
-            for source_key in source_priority:
-                fetcher = fetchers.get(source_key)
-                if fetcher is None:
-                    continue
-                papers = fetcher(query)
+        max_workers = min(len(tasks), 6)
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {
+                pool.submit(_fetch_task, sk, q, lbl): (sk, lbl)
+                for sk, q, lbl in tasks
+            }
+            for future in as_completed(futures):
+                source_key, label, papers = future.result()
                 if papers:
-                    any_source_succeeded = True
                     added = 0
                     for p in papers:
                         dedup_key = p.paper_id or p.title.lower().strip()
@@ -324,20 +358,12 @@ class PaperRetriever:
                         added,
                         len(all_papers),
                     )
-                    continue
-                logger.warning(
-                    "[%s] %s returned no results.",
-                    label,
-                    source_labels.get(source_key, source_key),
-                )
-            if not any_source_succeeded:
-                logger.warning("[%s] no sources returned results for query.", label)
-
-        _fetch_and_merge(query_original, "original")
-
-        # Only run expanded query if it differs meaningfully from the original
-        if query_expanded.strip() != query_original.strip():
-            _fetch_and_merge(query_expanded, "expanded")
+                else:
+                    logger.warning(
+                        "[%s] %s returned no results.",
+                        label,
+                        source_labels.get(source_key, source_key),
+                    )
 
         self.retrieved_papers_count += len(all_papers)
         logger.info(

@@ -48,6 +48,9 @@ from pipeline.answer_generator import AnswerGenerator
 
 # --- Import config ---
 from config.settings import (
+    ENTITY_EXTRACTION_FAST_MODEL,
+    ENTITY_EXTRACTION_MAX_CONCURRENCY,
+    ENTITY_EXTRACTION_MODEL,
     EMBEDDING_MODEL,
     ENTITY_EXTRACTION_MAX_WORKERS,
     FAST_MODE_TOP_K_PAPERS,
@@ -56,6 +59,7 @@ from config.settings import (
     LOW_CONFIDENCE_EXTRA_TOP_N,
     MAX_GRAPH_EXPANSION_ITERS,
     TOP_N_PAPERS,
+    USE_FAST_EXTRACTOR_IN_FAST_MODE,
 )
 from utils.session_state import SessionState
 
@@ -66,6 +70,25 @@ logger = get_logger(__name__)
 
 _EMBEDDING_SERVICE = EmbeddingService.get_instance(EMBEDDING_MODEL)
 _SESSION_STATE = SessionState()
+_MODEL_HEALTH_CACHE: dict[str, bool] = {}
+
+_ADAPTIVE_ANSWER_TOP_K_TARGET = 7
+_ADAPTIVE_EXTRACTION_SUCCESS_THRESHOLD = 0.80
+
+
+def _precheck_extractor_model(model_name: str) -> bool:
+    """Check extractor model availability once per process."""
+    cached = _MODEL_HEALTH_CACHE.get(model_name)
+    if cached is not None:
+        return cached
+
+    healthy, message = EntityExtractor.precheck_model_health(model_name)
+    _MODEL_HEALTH_CACHE[model_name] = healthy
+    if healthy:
+        logger.info("Extractor model precheck passed for '%s'.", model_name)
+    else:
+        logger.warning("Extractor model precheck failed for '%s': %s", model_name, message)
+    return healthy
 
 
 def _extract_query_terms(question: str) -> set[str]:
@@ -198,6 +221,8 @@ def run_pipeline(
     enable_confidence: bool = True,
     enable_expansion: bool = True,
     return_metrics: bool = True,
+    top_n_override: int | None = None,
+    top_k_override: int | None = None,
     # Backward-compatible aliases:
     return_details: bool | None = None,
     enable_reasoning_controller: bool | None = None,
@@ -225,6 +250,13 @@ def run_pipeline(
         "llm_calls": 0,
         "retrieved_papers": 0,
         "graph_expansion_iterations": 0,
+        "domain_detection_seconds": 0.0,
+        "retrieval_seconds": 0.0,
+        "filtering_seconds": 0.0,
+        "entity_extraction_seconds": 0.0,
+        "graph_build_seconds": 0.0,
+        "graph_retrieval_seconds": 0.0,
+        "answer_generation_seconds": 0.0,
     }
     emb_before = EmbeddingService.get_metrics()
 
@@ -242,10 +274,12 @@ def run_pipeline(
     # ------------------------------------------------------------------
     # Stage 1: Domain Detection
     # ------------------------------------------------------------------
+    t_stage = time.perf_counter()
     detector = DomainDetector(embedding_service=_EMBEDDING_SERVICE)
-    domain = detector.classify(query, method="keyword")
+    domain = detector.classify_robust(query)
     subdomain = detector.classify_subdomain(query, domain)
     intent = _detect_query_intent(query)
+    runtime_metrics["domain_detection_seconds"] += time.perf_counter() - t_stage
     logger.info(f"Detected domain: {domain}")
     logger.info(f"Detected subdomain: {subdomain}")
     logger.info(f"Detected intent: {intent}")
@@ -261,8 +295,12 @@ def run_pipeline(
         reuse_graph,
     )
 
-    top_n = FAST_MODE_TOP_N_PAPERS if (fast_mode and reuse_graph) else TOP_N_PAPERS
-    top_k = FAST_MODE_TOP_K_PAPERS if (fast_mode and reuse_graph) else 10
+    top_n = top_n_override if top_n_override is not None else (
+        FAST_MODE_TOP_N_PAPERS if (fast_mode and reuse_graph) else TOP_N_PAPERS
+    )
+    top_k = top_k_override if top_k_override is not None else (
+        FAST_MODE_TOP_K_PAPERS if (fast_mode and reuse_graph) else 10
+    )
 
     # ------------------------------------------------------------------
     # Stage 2: Paper Retrieval (with LLM query expansion + dual retrieval)
@@ -273,10 +311,13 @@ def run_pipeline(
         and reuse_graph
         and session.should_skip_retrieval()
     ):
+        t_stage = time.perf_counter()
         papers = session.get_cached_papers()
         logger.info("Fast mode enabled: skipped retrieval and reused %d cached papers.", len(papers))
         expanded_query = query  # no expansion needed when skipping retrieval
+        runtime_metrics["retrieval_seconds"] += time.perf_counter() - t_stage
     else:
+        t_stage = time.perf_counter()
         # Query expansion is embedded inside PaperRetriever.retrieve()
         # (Step 1 & 2).  We capture the expanded query for logging/expansion
         # loop re-use by creating the retriever once and calling expand_query.
@@ -287,6 +328,9 @@ def run_pipeline(
         runtime_metrics["retrieved_papers"] += len(retrieved_papers)
         session.cache_papers(retrieved_papers)
         papers = session.get_cached_papers() if reuse_graph else retrieved_papers
+        runtime_metrics["retrieval_seconds"] += time.perf_counter() - t_stage
+
+    retrieved_papers_snapshot = list(papers)
 
     logger.info(f"Retrieved {len(papers)} candidate papers")
     logger.info("[Step 11 diagnostics] original_query='%s'", query[:80])
@@ -295,9 +339,11 @@ def run_pipeline(
     # ------------------------------------------------------------------
     # Stage 3: Paper Filtering
     # ------------------------------------------------------------------
+    t_stage = time.perf_counter()
     paper_filter = PaperFilter(embedding_service=_EMBEDDING_SERVICE)
     filtered_papers = paper_filter.filter(papers, query, intent=intent, top_k=top_k)
     evidence_assessment = paper_filter.assess_evidence_consistency(query, filtered_papers)
+    runtime_metrics["filtering_seconds"] += time.perf_counter() - t_stage
     logger.info(f"Filtered to {len(filtered_papers)} papers")
     logger.info(
         "Intent-relevant papers after filter: %d",
@@ -313,14 +359,28 @@ def run_pipeline(
     # Stage 4: Entity Extraction
     # Pass the question so extraction is focused on relevant entities.
     # ------------------------------------------------------------------
-    extractor = EntityExtractor()
+    t_stage = time.perf_counter()
+    extraction_model = (
+        ENTITY_EXTRACTION_FAST_MODEL
+        if (fast_mode and USE_FAST_EXTRACTOR_IN_FAST_MODE)
+        else ENTITY_EXTRACTION_MODEL
+    )
+    if not _precheck_extractor_model(extraction_model):
+        logger.warning(
+            "Configured extractor model '%s' unavailable; using '%s'.",
+            extraction_model,
+            ENTITY_EXTRACTION_MODEL,
+        )
+        extraction_model = ENTITY_EXTRACTION_MODEL
+    extractor = EntityExtractor(model=extraction_model)
     entities, relations = extractor.extract(
         filtered_papers,
         question=query,
         extraction_cache=session.extraction_cache,
-        max_workers=ENTITY_EXTRACTION_MAX_WORKERS,
+        max_workers=max(ENTITY_EXTRACTION_MAX_WORKERS, ENTITY_EXTRACTION_MAX_CONCURRENCY),
         runtime_metrics=runtime_metrics,
     )
+    runtime_metrics["entity_extraction_seconds"] += time.perf_counter() - t_stage
     logger.info(f"Extracted {len(entities)} entities, {len(relations)} relations")
 
     strict_gate = bool(
@@ -346,6 +406,7 @@ def run_pipeline(
     # ------------------------------------------------------------------
     # Stage 5: Graph Construction
     # ------------------------------------------------------------------
+    t_stage = time.perf_counter()
     builder = GraphBuilder(embedding_service=_EMBEDDING_SERVICE)
     if reuse_graph and session.graph is not None:
         graph = session.graph
@@ -359,10 +420,12 @@ def run_pipeline(
     logger.info(
         f"Built graph: {graph.number_of_nodes()} nodes, {graph.number_of_edges()} edges"
     )
+    runtime_metrics["graph_build_seconds"] += time.perf_counter() - t_stage
 
     # ------------------------------------------------------------------
     # Stage 6: Graph Retrieval + confidence-aware iterative expansion
     # ------------------------------------------------------------------
+    t_stage = time.perf_counter()
     graph_retriever = GraphRetriever(embedding_service=_EMBEDDING_SERVICE)
     retrieval = graph_retriever.retrieve(
         query,
@@ -370,6 +433,44 @@ def run_pipeline(
         enable_reasoning_controller=enable_reasoning,
         runtime_metrics=runtime_metrics,
     )
+
+    # Adaptive top-k for answer grounding only:
+    # increase paper context size only when first-pass extraction quality is high
+    # and the retrieved graph is valid. This improves answer authority without
+    # forcing larger extraction loads on unstable runs.
+    filtered_papers_for_answer = filtered_papers
+    extraction_attempted = int(runtime_metrics.get("extraction_attempted", 0))
+    extraction_successful = int(runtime_metrics.get("extraction_successful", 0))
+    extraction_success_rate = (
+        (extraction_successful / extraction_attempted)
+        if extraction_attempted > 0
+        else 1.0
+    )
+    can_expand_answer_context = (
+        top_k < _ADAPTIVE_ANSWER_TOP_K_TARGET
+        and extraction_success_rate >= _ADAPTIVE_EXTRACTION_SUCCESS_THRESHOLD
+        and bool(retrieval.get("validation", {}).get("is_valid", False))
+    )
+    if can_expand_answer_context:
+        filtered_papers_for_answer = paper_filter.filter(
+            papers,
+            query,
+            intent=intent,
+            top_k=_ADAPTIVE_ANSWER_TOP_K_TARGET,
+        )
+        runtime_metrics["adaptive_answer_top_k_applied"] = 1
+        runtime_metrics["adaptive_answer_top_k"] = _ADAPTIVE_ANSWER_TOP_K_TARGET
+        logger.info(
+            "Adaptive answer top_k applied: %d -> %d (extraction_success_rate=%.2f, graph_valid=%s)",
+            top_k,
+            _ADAPTIVE_ANSWER_TOP_K_TARGET,
+            extraction_success_rate,
+            retrieval.get("validation", {}).get("is_valid", False),
+        )
+    else:
+        runtime_metrics["adaptive_answer_top_k_applied"] = 0
+        runtime_metrics["adaptive_answer_top_k"] = top_k
+    runtime_metrics["graph_retrieval_seconds"] += time.perf_counter() - t_stage
 
     low_confidence_mode = bool(
         strict_gate
@@ -387,6 +488,7 @@ def run_pipeline(
         )
     )
 
+    max_expansion_iters = min(MAX_GRAPH_EXPANSION_ITERS, 2)
     while (
         enable_confidence
         and enable_expansion
@@ -394,7 +496,7 @@ def run_pipeline(
             retrieval.get("graph_confidence", 0.0) < GRAPH_CONFIDENCE_THRESHOLD
             or retrieval.get("needs_focus_expansion", False)
         )
-        and expansion_iters < MAX_GRAPH_EXPANSION_ITERS
+        and expansion_iters < max_expansion_iters
     ):
         # Use the LLM-expanded query from Stage 2 (domain-agnostic).
         # If validation failed and we need focus, rely on the already-expanded
@@ -410,14 +512,17 @@ def run_pipeline(
             retrieval.get("graph_confidence", 0.0),
             GRAPH_CONFIDENCE_THRESHOLD,
             expansion_iters + 1,
-            MAX_GRAPH_EXPANSION_ITERS,
+            max_expansion_iters,
         )
         extra_retriever = PaperRetriever(top_n=LOW_CONFIDENCE_EXTRA_TOP_N)
+        t_stage = time.perf_counter()
         extra_papers = extra_retriever.retrieve(expanded_query, retrieval_domain)
         runtime_metrics["retrieved_papers"] += len(extra_papers)
         session.cache_papers(extra_papers)
+        runtime_metrics["retrieval_seconds"] += time.perf_counter() - t_stage
 
         candidate_pool = session.get_cached_papers() if session.get_cached_papers() else filtered_papers
+        t_stage = time.perf_counter()
         filtered_papers = paper_filter.filter(
             candidate_pool,
             expanded_query,
@@ -425,7 +530,9 @@ def run_pipeline(
             top_k=max(top_k, FAST_MODE_TOP_K_PAPERS + 2),
         )
         evidence_assessment = paper_filter.assess_evidence_consistency(expanded_query, filtered_papers)
+        runtime_metrics["filtering_seconds"] += time.perf_counter() - t_stage
 
+        t_stage = time.perf_counter()
         entities, relations = extractor.extract(
             filtered_papers,
             question=expanded_query,
@@ -433,16 +540,22 @@ def run_pipeline(
             max_workers=ENTITY_EXTRACTION_MAX_WORKERS,
             runtime_metrics=runtime_metrics,
         )
+        runtime_metrics["entity_extraction_seconds"] += time.perf_counter() - t_stage
+
+        t_stage = time.perf_counter()
         builder.add_entities(graph, entities)
         builder.add_relations(graph, relations)
         builder.optimize_for_query(graph, expanded_query)
+        runtime_metrics["graph_build_seconds"] += time.perf_counter() - t_stage
 
+        t_stage = time.perf_counter()
         retrieval = graph_retriever.retrieve(
             expanded_query,
             graph,
             enable_reasoning_controller=enable_reasoning,
             runtime_metrics=runtime_metrics,
         )
+        runtime_metrics["graph_retrieval_seconds"] += time.perf_counter() - t_stage
         expansion_iters += 1
         runtime_metrics["graph_expansion_iterations"] = expansion_iters
 
@@ -455,11 +568,12 @@ def run_pipeline(
     # Stage 7: Answer Generation
     # Pass the subgraph so sparse-graph detection can supplement context.
     # ------------------------------------------------------------------
+    t_stage = time.perf_counter()
     generator = AnswerGenerator()
     answer_dict = generator.generate(
         question=query,
         context_text=retrieval["context_text"],
-        papers=filtered_papers,
+        papers=filtered_papers_for_answer,
         subgraph=retrieval["subgraph"],
         reasoning_steps=retrieval.get("reasoning_steps", []),
         reasoning_paths=retrieval.get("reasoning_paths", []),
@@ -468,6 +582,7 @@ def run_pipeline(
         low_confidence_mode=low_confidence_mode,
         runtime_metrics=runtime_metrics,
     )
+    runtime_metrics["answer_generation_seconds"] += time.perf_counter() - t_stage
     logger.info("Answer generated successfully")
 
     session.domain = domain
@@ -515,6 +630,7 @@ def run_pipeline(
         "domain": domain,
         "subdomain": subdomain,
         "intent": intent,
+        "retrieved_papers": retrieved_papers_snapshot,
         "graph": graph,
         "filtered_papers": filtered_papers,
         "retrieval": retrieval,

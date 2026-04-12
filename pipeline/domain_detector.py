@@ -60,6 +60,11 @@ class DomainDetector:
             "earthquake", "volcano", "tectonic", "mineral", "sediment",
             "erosion", "geology", "seismic", "lithosphere", "mantle", "fault",
             "stratigraphy", "geomorphology", "magma", "plate", "groundwater",
+            # Mining, critical minerals, and resource extraction
+            "lithium", "extraction", "brine", "geothermal", "mining", "ore",
+            "rare earth", "pegmatite", "hydrometallurgy", "leaching", "smelting",
+            "cobalt", "nickel", "copper", "zinc", "molybdenum", "tungsten",
+            "critical mineral", "mineral resource", "reserve", "deposit",
         ],
         "Computer Science": [
             "machine learning", "deep learning", "underfitting", "overfitting",
@@ -89,7 +94,9 @@ class DomainDetector:
         ),
         "Geoscience": (
             "Study of earthquakes, volcanic activity, tectonic plate movement, "
-            "mineral formation, sediment erosion, and geological processes."
+            "mineral formation, sediment erosion, geological processes, lithium "
+            "and rare-earth extraction, geothermal brines, mining, critical "
+            "mineral resources, and hydrometallurgy."
         ),
         "Computer Science": (
             "Research on machine learning, deep learning, model training, "
@@ -159,6 +166,76 @@ class DomainDetector:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def classify_robust(self, question: str) -> str:
+        """
+        Robust two-signal classification: keyword + embedding consensus.
+
+        Strategy
+        --------
+        1. Run keyword classification to get a candidate domain and its
+           confidence margin (difference between top-1 and top-2 scores).
+        2. Run embedding classification for an independent signal.
+        3. If both agree → return that domain.
+        4. If they disagree and keyword margin is strong (≥ 2 hits ahead) →
+           trust keyword (strong lexical signal beats embedding for specific
+           technical terms like "lithium", "seismic").
+        5. Otherwise → trust embedding (richer semantic reference sentences
+           handle ambiguous or cross-domain queries better).
+        6. Never fall back to a hardcoded default: if keyword returns no hits,
+           embedding is used exclusively.
+
+        This avoids the failure mode where a single generic word like "methods"
+        gives Computer Science one keyword hit and wrongly wins over Geoscience.
+        """
+        q_lower = question.lower()
+
+        # --- Keyword scores ---
+        kw_scores: Dict[str, int] = {d: 0 for d in self.domains}
+        for domain in self.domains:
+            for kw in self._KEYWORDS.get(domain, []):
+                if kw in q_lower:
+                    kw_scores[domain] += 1
+
+        sorted_kw = sorted(kw_scores.items(), key=lambda x: x[1], reverse=True)
+        kw_winner, kw_top = sorted_kw[0]
+        kw_second = sorted_kw[1][1] if len(sorted_kw) > 1 else 0
+        kw_margin = kw_top - kw_second
+
+        # --- Embedding score ---
+        emb_winner = self.embedding_classify(question)
+
+        # --- Consensus logic ---
+        if kw_top == 0:
+            # No keyword evidence at all — use embedding exclusively
+            result = emb_winner
+            logger.info(
+                "classify_robust: no keyword hits → embedding='%s'", emb_winner
+            )
+        elif kw_winner == emb_winner:
+            # Both agree
+            result = kw_winner
+            logger.info(
+                "classify_robust: consensus='%s' (kw=%d, emb agrees)", kw_winner, kw_top
+            )
+        elif kw_margin >= 2:
+            # Keyword has a strong lead — trust it (e.g. "lithium extraction" with
+            # 5 Geoscience keyword hits vs 1 CS hit)
+            result = kw_winner
+            logger.info(
+                "classify_robust: kw strong margin=%d → kw='%s' overrides emb='%s'",
+                kw_margin, kw_winner, emb_winner,
+            )
+        else:
+            # Weak or tied keyword signal — trust the richer embedding representation
+            result = emb_winner
+            logger.info(
+                "classify_robust: weak kw margin=%d → emb='%s' overrides kw='%s'",
+                kw_margin, emb_winner, kw_winner,
+            )
+
+        logger.info("classify_robust: '%s' → '%s'", question[:60], result)
+        return result
 
     def classify(self, question: str, method: str = "llm") -> str:
         """
@@ -379,10 +456,12 @@ class DomainDetector:
                 return domain
 
         logger.warning(
-            f"LLM returned unrecognised domain '{raw}'; "
-            f"defaulting to '{self.domains[0]}'."
+            "LLM returned unrecognised domain '%s'; falling back to embedding classification.",
+            raw,
         )
-        return self.domains[0]
+        # Use embedding instead of a hardcoded default so the fallback is
+        # query-sensitive rather than always returning the first domain.
+        return self.embedding_classify(raw if len(raw) > 3 else "general science")
 
     def _get_groq_client(self) -> Groq:
         """

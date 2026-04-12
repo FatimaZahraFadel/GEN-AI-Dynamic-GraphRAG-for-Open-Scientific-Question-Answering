@@ -437,9 +437,20 @@ class PaperFilter:
         papers.sort(key=lambda p: p.relevance_score, reverse=True)
 
         # Off-topic pruning (domain-agnostic): remove papers that are both
-        # semantically weak and lexically weak for the current question.
-        min_semantic = 0.25
-        min_lexical = 0.10 if len(self._extract_focus_terms(question)) >= 2 else 0.0
+        # semantically weak AND lexically weak relative to the question.
+        # A paper needs to pass at least ONE gate to be kept.
+        #
+        # Thresholds:
+        #   min_semantic = 0.38 (cosine mapped to [0,1]; raw cosine ≈ -0.24)
+        #     — drops clear domain mismatches (e.g. ML papers for a mineral
+        #       extraction query) while keeping borderline relevant work.
+        #   min_lexical = 0.12  — at least ~1 focus term shared with the query.
+        #
+        # We always apply the pruning as long as at least 3 papers survive,
+        # to avoid being left with nothing when the corpus is small.
+        focus_term_count = len(self._extract_focus_terms(question))
+        min_semantic = 0.38
+        min_lexical = 0.12 if focus_term_count >= 2 else 0.0
         pruned: List[Paper] = []
         for paper in papers:
             sem = float(getattr(paper, "_semantic_score", 0.0))
@@ -447,7 +458,7 @@ class PaperFilter:
             if sem >= min_semantic or lex >= min_lexical:
                 pruned.append(paper)
 
-        if len(pruned) >= 5:
+        if len(pruned) >= 3:
             papers = pruned
 
         # Credibility pruning (domain-agnostic): when enough papers exist and

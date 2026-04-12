@@ -148,9 +148,23 @@ class AnswerGenerator:
             evidence_assessment=evidence_assessment or {},
             low_confidence_mode=low_confidence_mode,
         )
+        selected_papers = papers[:_MAX_PAPERS]
         if runtime_metrics is not None:
             runtime_metrics["llm_calls"] = runtime_metrics.get("llm_calls", 0) + 1
-        answer = self._call_llm(prompt)
+        try:
+            answer = self._call_llm(prompt)
+        except Exception as e:
+            if self._is_rate_limit_error(e):
+                logger.warning(
+                    "Rate limit encountered during answer generation; returning fallback answer."
+                )
+                answer = self._build_rate_limited_fallback_answer(
+                    question=question,
+                    papers=selected_papers,
+                    reasoning_paths=reasoning_paths or [],
+                )
+            else:
+                raise
 
         quality_issues = self._detect_quality_issues(answer, intent=intent, question=question)
         if quality_issues:
@@ -168,9 +182,29 @@ class AnswerGenerator:
             )
             if runtime_metrics is not None:
                 runtime_metrics["llm_calls"] = runtime_metrics.get("llm_calls", 0) + 1
-            answer = self._call_llm(repair_prompt)
+            try:
+                answer = self._call_llm(repair_prompt)
+            except Exception as e:
+                if self._is_rate_limit_error(e):
+                    logger.warning(
+                        "Rate limit encountered during repair pass; keeping first-pass answer."
+                    )
+                else:
+                    raise
 
         num_papers = min(len(papers), _MAX_PAPERS)
+
+        # Prepend a transparency notice when evidence is limited so that users
+        # know the answer is based on sparse or weakly-connected graph evidence.
+        if low_confidence_mode and answer and not answer.lstrip().startswith("⚠"):
+            n = len(papers)
+            paper_phrase = f"{n} paper{'s' if n != 1 else ''}" if n else "limited papers"
+            answer = (
+                f"⚠ *Limited evidence: this answer is based on {paper_phrase} with "
+                f"a sparse knowledge graph. Treat conclusions with appropriate caution.*\n\n"
+                + answer
+            )
+
         logger.info(
             f"Answer generated ({len(answer)} chars) using "
             f"{num_papers} paper(s) and model '{self.model}'."
@@ -182,6 +216,7 @@ class AnswerGenerator:
             "prompt_used": prompt,
             "model": self.model,
             "num_papers_used": num_papers,
+            "low_confidence": low_confidence_mode,
         }
 
     def build_prompt(
@@ -248,6 +283,7 @@ class AnswerGenerator:
         selected_papers = papers[:_MAX_PAPERS]
         evidence_terms = self._extract_candidate_terms(question, selected_papers)
         paper_lines: List[str] = []
+        summary_lines: List[str] = []
         for i, paper in enumerate(selected_papers, 1):
             abstract_snippet = truncate_text(
                 (paper.abstract or "").strip(),
@@ -260,7 +296,13 @@ class AnswerGenerator:
                 f"[{i}] Title: {paper.title}\n"
                 f"    Abstract: {abstract_snippet}"
             )
+            summary = self._build_extractive_summary(question, paper.abstract or "")
+            summary_lines.append(
+                f"[{i}] {paper.title}\n"
+                f"    Summary: {summary}"
+            )
         papers_block = "\n\n".join(paper_lines) if paper_lines else "No papers available."
+        summaries_block = "\n\n".join(summary_lines) if summary_lines else "No text summaries available."
         evidence_terms_block = ", ".join(evidence_terms[:12]) if evidence_terms else "None detected from titles/abstracts."
         evidence_diag_block = (
             f"consistency_score={evidence_assessment.get('consistency_score', 0.0)}; "
@@ -277,32 +319,19 @@ class AnswerGenerator:
         min_items = _INTENT_MIN_ITEMS.get(effective_mode, _INTENT_MIN_ITEMS.get(intent, 4))
         intent_instruction = self._build_intent_instruction(intent=effective_mode, min_items=min_items)
 
-        prompt = f"""You are a scientific question-answering assistant.
+        prompt = f"""You are a scientific question-answering assistant covering any scientific domain.
 
 Your task is to answer the question below using ONLY the information provided in the Graph Context and Supporting Papers sections. Do not use any outside knowledge or make speculative claims.
 
 Instructions:
-- Answer immediately with the direct answer; do not start with generic intro text.
-- Organize output using clear section headings and bullet points.
-- Keep every item concrete and actionable; avoid vague advice.
+- Answer immediately and directly; do not start with generic filler text.
+- Organize output using clear section headings (## bold) and bullet points appropriate to the question domain.
+- Keep every item concrete and evidence-backed; cite the specific paper or graph triple that supports it.
 - Cite supporting papers using the format [Paper: <title>] when you draw from them.
-- Prefer terms that appear in Graph Context, Candidate Evidence Terms, or Supporting Papers; do not invent entities.
-- Remove duplicates and weak graph nodes; keep only clear, relevant concepts.
+- Use terminology that appears in Graph Context, Candidate Evidence Terms, or Supporting Papers; do not invent entities.
 - Do not speculate beyond what the context supports.
-{intent_instruction}{confidence_instruction}- Include trade-offs or common mistakes where helpful.
-- End with: Practical Optimization Workflow (3-5 concise steps) when relevant.
-
-Output format:
-- Direct Answer:
-    - ...
-- Category 1:
-    - Technique -> What it is. When to use it. (optionally trade-off)
-- Category 2:
-    - Technique -> What it is. When to use it. (optionally trade-off)
-- Practical Optimization Workflow:
-    1. ...
-    2. ...
-    3. ...
+{intent_instruction}{confidence_instruction}- Include limitations, uncertainties, or conditions where evidence is mixed or sparse.
+- Close with a brief **Summary** (2-3 sentences) consolidating the key finding.
 
 ---
 QUESTION:
@@ -315,6 +344,10 @@ REASONING CHAIN (controller guidance):
 ---
 GRAPH CONTEXT (knowledge graph triples extracted from scientific literature):
 {context_text}
+
+---
+ORIGINAL TEXT SUMMARIES (extractive summaries from filtered papers):
+{summaries_block}
 
 ---
 CANDIDATE EVIDENCE TERMS (auto-mined from evidence text):
@@ -393,13 +426,43 @@ ANSWER:"""
         ranked = sorted(mentions.items(), key=lambda x: (-x[1], x[0]))
         return [name for name, _ in ranked]
 
+    def _build_extractive_summary(self, question: str, abstract: str, max_sentences: int = 2) -> str:
+        """Build lightweight query-focused extractive summary from abstract text."""
+        text = (abstract or "").strip()
+        if not text:
+            return "No abstract content available."
+
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+        if not sentences:
+            return truncate_text(text, 220)
+
+        q_terms = set(re.findall(r"\b[a-z][a-z\-]{3,}\b", (question or "").lower()))
+        stop = {
+            "what", "which", "when", "where", "that", "this", "there", "their",
+            "with", "from", "into", "about", "using", "based",
+        }
+        q_terms = {t for t in q_terms if t not in stop}
+
+        scored: List[tuple[float, int, str]] = []
+        for idx, sent in enumerate(sentences):
+            toks = set(re.findall(r"\b[a-z][a-z\-]{3,}\b", sent.lower()))
+            overlap = len(toks & q_terms) / max(len(q_terms), 1) if q_terms else 0.0
+            length_bonus = min(len(sent) / 220.0, 1.0)
+            score = (0.8 * overlap) + (0.2 * length_bonus)
+            scored.append((score, idx, sent))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        chosen = sorted(scored[:max_sentences], key=lambda x: x[1])
+        summary = " ".join(s for _, _, s in chosen)
+        return truncate_text(summary, 260)
+
     def _build_intent_instruction(self, intent: str, min_items: int) -> str:
         """Build intent-specific output requirements for stronger answer quality."""
         if intent == "solution":
             return (
-                f"- This is a solution question. Provide at least {min_items} concrete techniques.\\n"
-                "- Group techniques into categories (model-level, training, data, hyperparameter tuning).\\n"
-                "- For each technique include: what it is (1 sentence) and when to use it (1 sentence).\\n"
+                f"- This is a solution/methods question. Provide at least {min_items} concrete techniques or approaches.\\n"
+                "- Group related techniques under thematic section headings (e.g. by mechanism, scale, or application context).\\n"
+                "- For each technique include: what it is (1 sentence) and the evidence or condition supporting it (1 sentence).\\n"
                 "- Do not repeat the same concept with different wording.\\n"
             )
         if intent == "comparison":
@@ -413,10 +476,11 @@ ANSWER:"""
             )
         if intent == "list":
             return (
-                f"- This is a list question. Provide at least {min_items} non-duplicate items.\\n"
+                f"- This is a list question. Provide at least {min_items} non-duplicate, domain-specific items.\\n"
+                "- For each item give a brief description grounded in the provided evidence.\\n"
             )
         return (
-            f"- Provide at least {min_items} concrete points if the question asks for multiple methods/issues.\\n"
+            f"- Provide at least {min_items} concrete, evidence-grounded points.\\n"
         )
 
     def _infer_effective_mode(self, intent: str, question: str) -> str:
@@ -460,13 +524,16 @@ ANSWER:"""
         if effective_mode in {"solution", "list", "comparison", "process", "cause", "explanation"} and item_count < min_items:
             issues.append(f"insufficient_items:{item_count}<{min_items}")
 
-        lower = text.lower()
         if effective_mode in {"solution", "list"}:
-            if "practical optimization workflow" not in lower:
-                issues.append("missing_workflow_section")
-            category_markers = ["model", "training", "data", "hyperparameter"]
-            if sum(1 for m in category_markers if m in lower) < 2:
-                issues.append("missing_category_structure")
+            # Check for section/heading structure — any heading pattern counts,
+            # not a domain-specific phrase.
+            has_sections = bool(
+                re.search(r"(?:^|\n)#{1,3}\s+\w", text)          # markdown headings
+                or re.search(r"(?:^|\n)[A-Z][A-Za-z ]{3,}:\s*\n", text)  # "Title:\n" style
+                or re.search(r"(?:^|\n)\*\*[^*]+\*\*", text)     # bold headers
+            )
+            if not has_sections and item_count < 3:
+                issues.append("missing_structure")
 
         if len(text) < 500:
             issues.append("too_short")
@@ -493,13 +560,12 @@ Detected quality issues: {', '.join(quality_issues)}
 
 Hard constraints:
 - Provide at least {min_items} concrete items.
-- Use clear category headings and bullet points.
-- For each item include: what it is + when to use it.
-- Include practical trade-offs/common mistakes briefly.
+- Use clear category headings (bold or markdown ##) and bullet points.
+- For each item include: what it is + evidence or mechanism from the papers.
+- Include relevant caveats, limitations, or conditions where applicable.
 - Keep grounded to provided graph context and papers; no unsupported claims.
 - Avoid duplicate concepts.
-- End with section title exactly: Practical Optimization Workflow
-- Under that section include 3-5 numbered steps.
+- End with a brief summary section (2-3 sentences) consolidating the key finding.
 
 Graph Context:
 {context_text}
@@ -582,6 +648,72 @@ Return only the improved final answer."""
         except Exception as e:
             logger.error(f"Groq API error during answer generation: {e}")
             raise
+
+    def _is_rate_limit_error(self, error: Exception) -> bool:
+        """Return True when an exception looks like a provider rate-limit error."""
+        msg = str(error).lower()
+        markers = [
+            "rate limit",
+            "rate_limit_exceeded",
+            "error code: 429",
+            "tokens per day",
+            "tokens per minute",
+            "tpm",
+            "tpd",
+        ]
+        return any(marker in msg for marker in markers)
+
+    def _build_rate_limited_fallback_answer(
+        self,
+        question: str,
+        papers: List[Paper],
+        reasoning_paths: List[Dict],
+    ) -> str:
+        """
+        Build a deterministic, domain-neutral grounded answer when LLM calls
+        are rate-limited.
+
+        Assembles the answer directly from paper titles and abstracts so the
+        content is always topically relevant to the question.
+        """
+        lines: List[str] = []
+        lines.append(f"**Partial answer to:** {question}")
+        lines.append(
+            "\n*Note: LLM generation was rate-limited. "
+            "The following summary was assembled directly from retrieved papers.*\n"
+        )
+
+        if not papers:
+            lines.append("No papers were retrieved for this query.")
+            return "\n".join(lines)
+
+        lines.append("**Key findings from retrieved papers:**\n")
+        for i, paper in enumerate(papers[:6], 1):
+            title = paper.title or "Untitled"
+            year = paper.year if paper.year else "n.d."
+            snippet = (paper.abstract or "").strip()
+            # Take first 2 sentences of abstract as summary
+            sentences = re.split(r"(?<=[.!?])\s+", snippet)
+            summary = " ".join(sentences[:2]) if sentences else ""
+            summary = truncate_text(summary, 280)
+            lines.append(f"{i}. **{title}** ({year})")
+            if summary:
+                lines.append(f"   {summary}")
+            lines.append("")
+
+        if reasoning_paths:
+            lines.append("**Graph reasoning paths identified:**")
+            for p in reasoning_paths[:3]:
+                labels = p.get("labels", [])
+                if labels:
+                    lines.append(f"- {' → '.join(labels)}")
+            lines.append("")
+
+        lines.append("**Sources:**")
+        for paper in papers[:5]:
+            lines.append(f"- [Paper: {paper.title}]")
+
+        return "\n".join(lines)
 
     def _get_client(self) -> Groq:
         """

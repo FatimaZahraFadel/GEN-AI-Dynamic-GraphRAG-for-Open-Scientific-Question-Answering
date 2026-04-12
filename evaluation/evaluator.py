@@ -69,6 +69,7 @@ BENCHMARK: List[Dict] = [
     {
         "domain": "Agriculture",
         "question": "What fungal diseases affect wheat crops in humid environments?",
+        "question_type": "single-hop",
         "reference": (
             "Wheat crops in humid environments are susceptible to several fungal diseases "
             "including rust (stem rust, leaf rust, stripe rust caused by Puccinia species), "
@@ -80,6 +81,7 @@ BENCHMARK: List[Dict] = [
     {
         "domain": "Agriculture",
         "question": "How does drought stress affect crop yield?",
+        "question_type": "single-hop",
         "reference": (
             "Drought stress reduces crop yield by limiting water availability for photosynthesis, "
             "nutrient uptake, and cell expansion. It triggers stomatal closure, reducing CO2 "
@@ -91,6 +93,7 @@ BENCHMARK: List[Dict] = [
     {
         "domain": "Agriculture",
         "question": "What are the effects of soil degradation on agricultural productivity?",
+        "question_type": "single-hop",
         "reference": (
             "Soil degradation reduces agricultural productivity by decreasing organic matter, "
             "nutrient availability, and water retention capacity. Erosion removes the fertile "
@@ -103,6 +106,7 @@ BENCHMARK: List[Dict] = [
     {
         "domain": "Geoscience",
         "question": "How do tectonic plate movements trigger earthquakes?",
+        "question_type": "single-hop",
         "reference": (
             "Tectonic plates move due to convection currents in the mantle. At plate boundaries, "
             "stress accumulates as plates converge, diverge, or slide past one another. When "
@@ -114,6 +118,7 @@ BENCHMARK: List[Dict] = [
     {
         "domain": "Geoscience",
         "question": "What causes volcanic eruptions near subduction zones?",
+        "question_type": "single-hop",
         "reference": (
             "At subduction zones, an oceanic plate descends beneath a continental or oceanic plate. "
             "As the subducting slab sinks deeper, increasing pressure and temperature cause "
@@ -125,6 +130,7 @@ BENCHMARK: List[Dict] = [
     {
         "domain": "Geoscience",
         "question": "How does erosion affect sediment transport in river systems?",
+        "question_type": "single-hop",
         "reference": (
             "Erosion detaches soil and rock particles from hillslopes and channel banks, "
             "supplying sediment to river systems. Rivers transport this material as bedload, "
@@ -138,6 +144,7 @@ BENCHMARK: List[Dict] = [
     {
         "domain": "Environment",
         "question": "What are the main causes of deforestation in tropical regions?",
+        "question_type": "single-hop",
         "reference": (
             "The main causes of tropical deforestation include agricultural expansion "
             "(cattle ranching and soy production), commercial logging, infrastructure development "
@@ -150,6 +157,7 @@ BENCHMARK: List[Dict] = [
     {
         "domain": "Environment",
         "question": "How do carbon emissions contribute to climate change?",
+        "question_type": "single-hop",
         "reference": (
             "Carbon dioxide and other greenhouse gases released by burning fossil fuels, "
             "deforestation, and industrial processes trap outgoing infrared radiation in the "
@@ -161,6 +169,7 @@ BENCHMARK: List[Dict] = [
     {
         "domain": "Environment",
         "question": "What is the impact of biodiversity loss on ecosystems?",
+        "question_type": "single-hop",
         "reference": (
             "Biodiversity loss weakens ecosystem functioning by reducing species that perform "
             "key roles such as pollination, decomposition, nutrient cycling, and pest regulation. "
@@ -174,6 +183,7 @@ BENCHMARK: List[Dict] = [
     {
         "domain": "Supply Chain",
         "question": "How can inventory forecasting improve warehouse efficiency?",
+        "question_type": "single-hop",
         "reference": (
             "Accurate inventory forecasting reduces overstock and stockout situations by aligning "
             "stock levels with expected demand. This minimises storage costs, frees up warehouse "
@@ -185,6 +195,7 @@ BENCHMARK: List[Dict] = [
     {
         "domain": "Supply Chain",
         "question": "What strategies reduce supplier disruption risk?",
+        "question_type": "single-hop",
         "reference": (
             "Strategies to reduce supplier disruption risk include multi-sourcing (qualifying "
             "multiple suppliers for critical components), holding safety stock, nearshoring or "
@@ -197,6 +208,7 @@ BENCHMARK: List[Dict] = [
     {
         "domain": "Supply Chain",
         "question": "How does procurement optimization reduce logistics costs?",
+        "question_type": "single-hop",
         "reference": (
             "Procurement optimisation reduces logistics costs by consolidating orders to achieve "
             "volume discounts and reduce shipment frequency, selecting suppliers closer to "
@@ -204,6 +216,218 @@ BENCHMARK: List[Dict] = [
             "terms. Standardising packaging, improving demand forecasting to avoid expedited "
             "shipping, and using reverse auctions to increase supplier competition further drive "
             "down total landed costs."
+        ),
+    },
+
+    # ===========================================================================
+    # Multi-hop questions — these require connecting at least two intermediate
+    # concepts to reach the answer, exercising GraphRAG's multi-hop path retrieval.
+    # ===========================================================================
+
+    # --- Agriculture multi-hop ---
+    {
+        "domain": "Agriculture",
+        "question": (
+            "Through what chain of biological mechanisms does high humidity promote "
+            "yield loss in wheat crops?"
+        ),
+        "question_type": "multi-hop",
+        "reference": (
+            "High humidity creates conditions favourable for fungal spore germination "
+            "and dispersal. Spores of pathogens such as Puccinia (rust) and Blumeria graminis "
+            "(powdery mildew) germinate on leaf surfaces under high moisture, forming infection "
+            "structures that penetrate epidermal cells. The resulting lesions disrupt "
+            "photosynthesis by destroying chloroplast-containing mesophyll tissue, reducing "
+            "the assimilation of CO2. Diminished photosynthate supply limits grain filling, "
+            "directly reducing grain weight and number, leading to yield loss. Additionally, "
+            "infected plants divert resources to defence responses rather than grain development."
+        ),
+    },
+    {
+        "domain": "Agriculture",
+        "question": (
+            "How does soil organic matter loss caused by erosion affect crop nutrient "
+            "availability and subsequently grain protein content?"
+        ),
+        "question_type": "multi-hop",
+        "reference": (
+            "Soil erosion preferentially removes the topsoil layer, which is richest in "
+            "organic matter. Loss of organic matter reduces the pool of mineralizable nitrogen "
+            "because decomposing organic material is the primary source of plant-available "
+            "ammonium and nitrate in non-fertilised systems. Lower soil nitrogen availability "
+            "limits protein synthesis in the developing grain because grain protein (mainly "
+            "gluten proteins in wheat) is assembled from nitrogen remobilised from vegetative "
+            "tissues and from continued nitrogen uptake during grain filling. Restricted nitrogen "
+            "supply reduces both the quantity and quality of grain protein, lowering flour "
+            "protein content and baking quality."
+        ),
+    },
+
+    # --- Geoscience multi-hop ---
+    {
+        "domain": "Geoscience",
+        "question": (
+            "How does subduction of oceanic crust eventually lead to arc volcanism "
+            "and what role does water play in this process?"
+        ),
+        "question_type": "multi-hop",
+        "reference": (
+            "As an oceanic plate subducts, pressure and temperature increase with depth. "
+            "Hydrated minerals in the oceanic crust—such as serpentinite, amphibole, and "
+            "chlorite—become thermodynamically unstable and release structural water through "
+            "dehydration reactions. This water migrates upward into the overlying mantle wedge "
+            "where it acts as a flux, lowering the peridotite solidus by several hundred degrees "
+            "and inducing partial melting. The resulting hydrous, silica-enriched magma is less "
+            "dense than the surrounding mantle, allowing it to rise buoyantly through the "
+            "lithosphere. It accumulates in crustal magma chambers and eventually erupts at the "
+            "surface forming volcanic arcs parallel to the subduction trench."
+        ),
+    },
+    {
+        "domain": "Geoscience",
+        "question": (
+            "What sequence of events connects glacial retreat to increased volcanic "
+            "activity in Iceland?"
+        ),
+        "question_type": "multi-hop",
+        "reference": (
+            "Iceland sits on the Mid-Atlantic Ridge above a mantle plume. During glacial "
+            "periods, thick ice sheets exert confining pressure on the underlying crust, "
+            "suppressing mantle decompression melting. As glaciers retreat during deglaciation, "
+            "the lithostatic load on the mantle decreases rapidly. This pressure reduction "
+            "lowers the melting point of the asthenosphere, triggering decompression melting and "
+            "generating greater volumes of magma. The increased melt supply raises eruption rates, "
+            "as documented in Icelandic volcanic records showing elevated volcanism during and "
+            "after the last glacial maximum retreat."
+        ),
+    },
+
+    # --- Environment multi-hop ---
+    {
+        "domain": "Environment",
+        "question": (
+            "How does the loss of apex predators through hunting trigger cascading "
+            "effects on vegetation and carbon storage in terrestrial ecosystems?"
+        ),
+        "question_type": "multi-hop",
+        "reference": (
+            "Apex predators such as wolves or large felids regulate herbivore populations "
+            "through direct predation and the 'landscape of fear'—herbivores avoid certain "
+            "areas when predators are present, reducing browsing pressure. When apex predators "
+            "are removed, herbivore populations increase and graze or browse more intensively. "
+            "This reduces plant biomass and canopy cover, particularly affecting woody plants "
+            "and shrubs that store large amounts of carbon in above-ground biomass. Reduced "
+            "vegetation cover also diminishes root turnover and organic matter inputs to soil, "
+            "decreasing soil carbon stocks. The combined loss of above-ground and below-ground "
+            "carbon diminishes the ecosystem's role as a carbon sink, contributing to higher "
+            "atmospheric CO2 concentrations."
+        ),
+    },
+    {
+        "domain": "Environment",
+        "question": (
+            "Through what mechanism does ocean acidification caused by CO2 emissions "
+            "affect coral reef calcification and ultimately reef biodiversity?"
+        ),
+        "question_type": "multi-hop",
+        "reference": (
+            "Atmospheric CO2 dissolves in seawater, forming carbonic acid which dissociates "
+            "into bicarbonate and hydrogen ions, reducing seawater pH. The increased hydrogen "
+            "ion concentration reacts with carbonate ions, reducing the saturation state of "
+            "aragonite and calcite—the minerals used by corals to build their calcium carbonate "
+            "skeletons. At lower aragonite saturation, the energetic cost of calcification "
+            "increases and skeletal growth rates decline. Weaker, more porous skeletons are more "
+            "susceptible to bioerosion and storm damage, leading to net reef erosion exceeding "
+            "accretion at projected pH levels. Reef structural complexity declines, reducing "
+            "the habitat heterogeneity that supports high fish and invertebrate biodiversity."
+        ),
+    },
+
+    # --- Supply Chain multi-hop ---
+    {
+        "domain": "Supply Chain",
+        "question": (
+            "How does a port disruption at a major hub propagate through a just-in-time "
+            "supply chain to affect final product availability on retail shelves?"
+        ),
+        "question_type": "multi-hop",
+        "reference": (
+            "Just-in-time (JIT) supply chains hold minimal buffer inventory, relying on "
+            "precise timing of inbound shipments. When a port disruption delays container "
+            "unloading, inbound component shipments to manufacturing plants are delayed. Without "
+            "safety stock, production lines stop or switch to alternative components, causing "
+            "output shortfalls. Manufacturers notify distributors of delivery delays; "
+            "distributors in turn cannot fulfil retailer orders on the agreed schedule. Retailers "
+            "experience stockouts faster than in conventional supply chains because they also "
+            "carry lean inventory aligned to JIT principles. The disruption amplifies upstream "
+            "due to the bullwhip effect: retailers over-order in response to uncertainty, "
+            "triggering inventory oscillations that can persist for weeks after port operations "
+            "normalise."
+        ),
+    },
+    {
+        "domain": "Supply Chain",
+        "question": (
+            "How does supplier geographic concentration combined with climate-related "
+            "extreme weather events create systemic risk in global electronics supply chains?"
+        ),
+        "question_type": "multi-hop",
+        "reference": (
+            "The electronics industry is characterised by high geographic concentration of "
+            "critical component manufacturing—semiconductors in Taiwan and South Korea, "
+            "rare-earth processing in China. Climate-related events such as floods, droughts "
+            "affecting cooling water for fabs, or typhoons disrupting logistics create "
+            "simultaneous supply shocks across multiple tiers because many OEMs share the same "
+            "small pool of suppliers. Single-source dependencies mean there is no alternative "
+            "supply to absorb the shock. Disruption propagates downstream through OEMs to "
+            "consumer electronics brands and retailers globally. Because component lead times "
+            "are long (12–52 weeks for advanced chips), recovery is slow, amplifying the "
+            "financial impact and creating systemic rather than isolated supply risk."
+        ),
+    },
+
+    # --- Computer Science multi-hop ---
+    {
+        "domain": "Computer Science",
+        "question": (
+            "How does gradient vanishing in deep neural networks arise from the choice of "
+            "activation function and how does it degrade model training outcomes?"
+        ),
+        "question_type": "multi-hop",
+        "reference": (
+            "During backpropagation, gradients are computed by multiplying partial derivatives "
+            "layer by layer via the chain rule. Activation functions such as sigmoid and tanh "
+            "saturate at extreme input values, producing derivatives close to zero in those "
+            "regions. When many such layers are stacked, the product of small gradient terms "
+            "across layers becomes exponentially small—the gradient 'vanishes' before reaching "
+            "early layers. Early layers consequently receive near-zero gradient updates and "
+            "their weights barely change, making it impossible for the network to learn useful "
+            "lower-level representations. The result is that training loss stagnates and the "
+            "model performs poorly despite sufficient capacity. ReLU and its variants mitigate "
+            "this by having a derivative of 1 for positive inputs, preserving gradient magnitude "
+            "across layers."
+        ),
+    },
+    {
+        "domain": "Computer Science",
+        "question": (
+            "How does the attention mechanism in transformers enable better long-range "
+            "dependency modelling compared to recurrent neural networks, and why does "
+            "this improve natural language understanding tasks?"
+        ),
+        "question_type": "multi-hop",
+        "reference": (
+            "Recurrent neural networks process sequences token by token, maintaining a hidden "
+            "state that must encode all prior context. Long-range dependencies require "
+            "information to be propagated through many time steps, during which gradients "
+            "vanish and relevant information dilutes in the hidden state. The transformer's "
+            "self-attention mechanism computes pairwise similarity between all token positions "
+            "simultaneously, allowing any token to directly attend to any other regardless of "
+            "distance. Attention weights are learned, so the model can focus on the most "
+            "relevant tokens for each prediction without information having to travel through "
+            "intermediate states. This direct access to long-range context leads to better "
+            "coreference resolution, semantic role labelling, and question answering, "
+            "improving overall natural language understanding benchmarks."
         ),
     },
 ]
@@ -283,6 +507,64 @@ def keyword_coverage(prediction: str, reference: str) -> float:
     if not ref_keywords:
         return 0.0
     return len(ref_keywords & pred_tokens) / len(ref_keywords)
+
+
+# ---------------------------------------------------------------------------
+# Semantic similarity metric (embedding-based BERTScore proxy)
+# ---------------------------------------------------------------------------
+
+def semantic_similarity(prediction: str, reference: str) -> float:
+    """
+    Compute cosine similarity between the sentence embeddings of *prediction*
+    and *reference* using the shared EmbeddingService.
+
+    This is a lightweight proxy for BERTScore: it captures semantic overlap
+    that ROUGE misses (paraphrasing, synonyms) without requiring the
+    ``bert_score`` package.
+
+    Returns
+    -------
+    float
+        Cosine similarity in [0, 1].  Values below 0 are clipped to 0.
+    """
+    if not prediction or not reference:
+        return 0.0
+    try:
+        from pipeline.embedding_service import EmbeddingService
+        svc = EmbeddingService.get_instance()
+        pred_emb = svc.encode_text(prediction)
+        ref_emb = svc.encode_text(reference)
+        denom = float(np.linalg.norm(pred_emb) * np.linalg.norm(ref_emb))
+        if denom == 0.0:
+            return 0.0
+        return float(max(0.0, np.dot(pred_emb, ref_emb) / denom))
+    except Exception:
+        return 0.0
+
+
+def citation_grounding(prediction: str, context: str) -> float:
+    """
+    Compute the fraction of ``[Paper: <title>]`` citations in *prediction*
+    that reference paper titles actually present in *context*.
+
+    A citation is considered grounded if its extracted title substring appears
+    (case-insensitively) anywhere in the retrieval context.  This detects
+    hallucinated citations — papers the LLM invented rather than retrieved.
+
+    Returns
+    -------
+    float
+        Grounding ratio in [0, 1].  Returns 1.0 when no citations are present
+        (nothing to check).
+    """
+    citation_pattern = re.compile(r"\[Paper:\s*([^\]]+)\]", re.IGNORECASE)
+    citations = citation_pattern.findall(prediction)
+    if not citations:
+        return 1.0  # No citations — no hallucination evidence
+
+    ctx_lower = context.lower()
+    grounded = sum(1 for c in citations if c.strip().lower()[:40] in ctx_lower)
+    return round(grounded / len(citations), 4)
 
 
 # ---------------------------------------------------------------------------
@@ -671,14 +953,27 @@ class Evaluator:
 
                 out = self._normalize_mode_output(out)
                 scores = self.score_answer_stable(out["answer"], question, out.get("context", ""))
+                reference_text = meta.get("reference", "")
+                answer_text = out["answer"]
+                context_text = out.get("context", "")
+                lexical_metrics = {
+                    "rouge1_f1": round(rouge_n_f1(answer_text, reference_text, 1), 4),
+                    "rouge2_f1": round(rouge_n_f1(answer_text, reference_text, 2), 4),
+                    "keyword_coverage": round(keyword_coverage(answer_text, reference_text), 4),
+                    "semantic_similarity": round(semantic_similarity(answer_text, reference_text), 4),
+                    "citation_grounding": round(citation_grounding(answer_text, context_text), 4),
+                    "answer_length": len(answer_text.split()),
+                    "question_type": meta.get("question_type", "single-hop"),
+                }
                 rows.append(
                     {
                         "mode": mode,
                         "question": question,
                         "domain": domain,
-                        "reference": meta.get("reference", ""),
-                        "answer": out["answer"],
+                        "reference": reference_text,
+                        "answer": answer_text,
                         "scores": scores,
+                        "lexical_metrics": lexical_metrics,
                         "metrics": out["metrics"],
                         "graph_metrics": out["graph_metrics"],
                         "confidence": out["confidence"],
@@ -690,11 +985,20 @@ class Evaluator:
             vals = [float(r["scores"][key]) for r in rows if r["mode"] == mode and r.get("valid", True)]
             return round(sum(vals) / max(len(vals), 1), 3)
 
+        def _lex_avg(mode: str, key: str) -> float:
+            vals = [float(r["lexical_metrics"][key]) for r in rows if r["mode"] == mode and key in r.get("lexical_metrics", {})]
+            return round(sum(vals) / max(len(vals), 1), 4)
+
         ablation = {
             mode: {
                 "groundedness": _avg(mode, "groundedness"),
                 "reasoning": _avg(mode, "reasoning"),
                 "hallucination": _avg(mode, "hallucination"),
+                "rouge1_f1": _lex_avg(mode, "rouge1_f1"),
+                "rouge2_f1": _lex_avg(mode, "rouge2_f1"),
+                "keyword_coverage": _lex_avg(mode, "keyword_coverage"),
+                "semantic_similarity": _lex_avg(mode, "semantic_similarity"),
+                "citation_grounding": _lex_avg(mode, "citation_grounding"),
             }
             for mode in MODES.keys()
         }
@@ -767,6 +1071,11 @@ class Evaluator:
                 "Groundedness": vals["groundedness"],
                 "Reasoning": vals["reasoning"],
                 "Hallucination": vals["hallucination"],
+                "ROUGE-1": vals.get("rouge1_f1", 0.0),
+                "ROUGE-2": vals.get("rouge2_f1", 0.0),
+                "Keyword Coverage": vals.get("keyword_coverage", 0.0),
+                "Semantic Similarity": vals.get("semantic_similarity", 0.0),
+                "Citation Grounding": vals.get("citation_grounding", 0.0),
             }
             for mode, vals in results.get("ablation", {}).items()
         ]

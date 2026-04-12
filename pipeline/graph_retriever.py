@@ -26,7 +26,12 @@ logger = get_logger(__name__)
 
 _TOP_K_SEEDS = 5
 _HOP_DEPTH = 2
-_MIN_SEED_SIMILARITY = 0.20
+# Minimum cosine similarity for a node to qualify as a seed entity.
+# 0.35 keeps only nodes with a meaningful relationship to the query,
+# reducing subgraph noise from unrelated BFS expansions. The fallback
+# in extract_seed_entities still uses ranked_indices when no node clears
+# this threshold, so sparse graphs are handled gracefully.
+_MIN_SEED_SIMILARITY = 0.35
 
 
 def compute_graph_confidence(graph: nx.DiGraph, seed_scores: Dict[str, float]) -> float:
@@ -214,6 +219,21 @@ class GraphRetriever:
         degree_norm = min(degree / 20.0, 1.0)
         return 0.5 * degree_norm + 0.5 * min(avg_weight, 1.0)
 
+    def _hub_penalty(self, graph: nx.DiGraph, nid: str) -> float:
+        """
+        Return penalty factor in [0,1] for high-degree hub nodes.
+
+        Higher values indicate generic hub-like nodes that should be down-weighted
+        during retrieval to promote specific evidence paths.
+        """
+        num_nodes = graph.number_of_nodes()
+        if num_nodes <= 2:
+            return 0.0
+        degree = float(graph.degree(nid))
+        # Soft-normalized by graph size; robust across sparse/dense runs.
+        degree_norm = min(degree / max((num_nodes - 1), 1), 1.0)
+        return degree_norm
+
     def extract_seed_entities(
         self, question: str, graph: nx.DiGraph
     ) -> Tuple[List[str], Dict[str, float]]:
@@ -285,10 +305,14 @@ class GraphRetriever:
         # Step 8 — Hybrid score: similarity + structural importance
         hybrid_scores = []
         importance_scores = []
+        hub_penalties = []
         for i, nid in enumerate(node_ids):
             imp = self._node_importance(graph, nid)
+            hub_pen = self._hub_penalty(graph, nid)
             importance_scores.append(imp)
-            hybrid = 0.70 * float(sim_scores[i]) + 0.30 * imp
+            hub_penalties.append(hub_pen)
+            # Penalty-based retrieval: reduce score of generic hub nodes.
+            hybrid = (0.72 * float(sim_scores[i])) + (0.28 * imp) - (0.20 * hub_pen)
             hybrid_scores.append(hybrid)
 
         # Rank by hybrid score and keep top-k
@@ -418,12 +442,15 @@ class GraphRetriever:
             edge_weight_score = float(np.mean(edge_weights)) if edge_weights else 0.5
             # Paper support: reward paths evidenced by multiple real papers
             paper_freq_score = min(len(paper_ids) / max(len(path) - 1, 1), 1.0)
+            # Penalize hub-heavy paths so specific paths are preferred.
+            path_hub_penalty = float(np.mean([self._hub_penalty(subgraph, n) for n in path]))
 
             total = (
                 0.25 * length_score
                 + 0.35 * node_relevance
                 + 0.25 * edge_weight_score
                 + 0.15 * paper_freq_score
+                - 0.15 * path_hub_penalty
             )
 
             label_path = [subgraph.nodes[n].get("label", n) for n in path]
@@ -519,7 +546,7 @@ class GraphRetriever:
             if seed in subgraph and subgraph.degree(seed) == 0:
                 isolated_seed_count += 1
         if isolated_seed_count > 0:
-            subgraph = self._graph_builder.get_subgraph(graph, seed_entity_ids, depth + 1)
+            subgraph = self._graph_builder.get_subgraph(graph, seed_entity_ids, min(depth + 1, 2))
 
         logger.info(
             f"retrieve_subgraph: {subgraph.number_of_nodes()} nodes, "

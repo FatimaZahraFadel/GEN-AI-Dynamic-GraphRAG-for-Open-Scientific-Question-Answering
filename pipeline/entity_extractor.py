@@ -8,6 +8,8 @@ feed directly into the graph-building stage.
 """
 
 import json
+import hashlib
+import asyncio
 import os
 import random
 import re
@@ -29,32 +31,45 @@ load_dotenv()
 logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
-# Controlled vocabularies
+# Controlled vocabularies — domain-agnostic
 # ---------------------------------------------------------------------------
+# These types are intentionally broad so the same extractor works for
+# Agriculture, Geoscience, Computer Science, Supply Chain, and Environment
+# without requiring domain-specific prompts.
+#
+# Mapping examples (old → new):
+#   Crop / Organism           → Concept / Entity
+#   Disease / Condition       → Problem / Condition
+#   Treatment / Method        → Method / Intervention
+#   Environment / Location    → Context / Location
+#   Cause / Factor            → Cause / Factor      (unchanged)
+#   Effect / Outcome          → Effect / Outcome     (unchanged)
 
 ENTITY_TYPES = [
-    "Crop / Organism",
-    "Disease / Condition",
-    "Treatment / Method",
-    "Environment / Location",
-    "Cause / Factor",
-    "Effect / Outcome",
+    "Concept / Entity",      # organisms, materials, systems, datasets, models, genes, …
+    "Problem / Condition",   # diseases, failures, risks, deficiencies, bugs, anomalies, …
+    "Method / Intervention", # techniques, algorithms, treatments, protocols, tools, …
+    "Context / Location",    # environments, regions, platforms, settings, domains, …
+    "Cause / Factor",        # drivers, risk factors, inputs, constraints, stressors, …
+    "Effect / Outcome",      # results, metrics, impacts, performance, consequences, …
 ]
 
 RELATION_TYPES = [
-    "affects",
-    "treats",
-    "occurs_in",
-    "caused_by",
-    "leads_to",
-    "detected_by",
-    "studied_in",
+    "affects",       # factor/entity changes another variable or system behaviour
+    "mitigates",     # method/intervention reduces a problem or negative outcome
+    "occurs_in",     # condition/process appears in a context/environment
+    "caused_by",     # condition/outcome attributable to a factor
+    "leads_to",      # upstream cause/mechanism produces a downstream outcome
+    "detected_by",   # entity/condition identified by a method or signal
+    "studied_in",    # concept is investigated within a context or domain
+    "correlates_with",  # statistical or observed co-variation between entities
+    "depends_on",    # entity or process requires another entity/condition
+    "part_of",       # entity is a component or sub-system of another
 ]
 
-_MAX_EXTRACTION_RETRIES = 3
-_BASE_BACKOFF_SECONDS = 1.0
-_BACKOFF_JITTER_MAX_SECONDS = 0.6
-_MAX_CONCURRENT_LLM_REQUESTS = 2
+_MAX_EXTRACTION_RETRIES = 2        # 2 attempts per prompt; reduces worst-case latency
+_BASE_BACKOFF_SECONDS = 0.5        # 0.5s → 1.0s (was 1s → 2s → 4s)
+_BACKOFF_JITTER_MAX_SECONDS = 0.3
 _STRICT_JSON_RETRY_MAX = 1
 
 
@@ -110,12 +125,20 @@ class EntityExtractor:
             ``"llama3-8b-8192"``.
         """
         self.model = model
+        self._fallback_model = "llama-3.1-8b-instant"
         self._client: Groq | None = None
         self.llm_calls: int = 0
         self._stats_lock = Lock()
         self._retry_count: int = 0
         self._json_retry_count: int = 0
         self._fallback_count: int = 0
+
+    def _paper_cache_key(self, paper: Paper) -> str:
+        """Build a stable cache key from paper identity or content fingerprint."""
+        if paper.paper_id:
+            return f"pid:{paper.paper_id}"
+        payload = f"{paper.title}\n{paper.abstract or ''}".strip().encode("utf-8", errors="ignore")
+        return f"fp:{hashlib.sha1(payload).hexdigest()}"
 
     # ------------------------------------------------------------------
     # Public API
@@ -159,8 +182,12 @@ class EntityExtractor:
         cache_hits = 0
 
         for paper in papers:
-            if paper.paper_id and paper.paper_id in extraction_cache:
-                entities, relations = extraction_cache[paper.paper_id]
+            cache_key = self._paper_cache_key(paper)
+            if cache_key in extraction_cache:
+                entities, relations = extraction_cache[cache_key]
+                cache_hits += 1
+            elif paper.paper_id and f"pid:{paper.paper_id}" in extraction_cache:
+                entities, relations = extraction_cache[f"pid:{paper.paper_id}"]
                 cache_hits += 1
             else:
                 papers_to_extract.append(paper)
@@ -190,18 +217,14 @@ class EntityExtractor:
 
         # Parallel extraction for new papers.
         extracted_results: List[Tuple[str, List[Entity], List[Relation]]] = []
-        worker_count = max(1, min(max_workers, _MAX_CONCURRENT_LLM_REQUESTS))
+        worker_count = max(1, int(max_workers))
 
         if papers_to_extract and worker_count > 1:
-            with ThreadPoolExecutor(max_workers=worker_count) as executor:
-                futures = {
-                    executor.submit(self.extract_from_abstract, paper, question): paper
-                    for paper in papers_to_extract
-                }
-                for future in as_completed(futures):
-                    paper = futures[future]
-                    entities, relations = future.result()
-                    extracted_results.append((paper.paper_id, entities, relations))
+            extracted_results = self._extract_async_concurrent(
+                papers=papers_to_extract,
+                question=question,
+                max_concurrency=worker_count,
+            )
         else:
             for paper in papers_to_extract:
                 entities, relations = self.extract_from_abstract(paper, question)
@@ -209,7 +232,12 @@ class EntityExtractor:
 
         for paper_id, entities, relations in extracted_results:
             if paper_id:
-                extraction_cache[paper_id] = (entities, relations)
+                extraction_cache[f"pid:{paper_id}"] = (entities, relations)
+
+            for paper in papers_to_extract:
+                if paper.paper_id == paper_id:
+                    extraction_cache[self._paper_cache_key(paper)] = (entities, relations)
+                    break
 
             for entity in entities:
                 if entity.id not in seen_entity_ids:
@@ -244,6 +272,38 @@ class EntityExtractor:
         )
         return all_entities, all_relations
 
+    def _extract_async_concurrent(
+        self,
+        papers: List[Paper],
+        question: str,
+        max_concurrency: int,
+    ) -> List[Tuple[str, List[Entity], List[Relation]]]:
+        """Run extraction using async scheduling with bounded concurrency."""
+
+        async def _runner() -> List[Tuple[str, List[Entity], List[Relation]]]:
+            sem = asyncio.Semaphore(max(1, max_concurrency))
+
+            async def _one(paper: Paper) -> Tuple[str, List[Entity], List[Relation]]:
+                async with sem:
+                    entities, relations = await asyncio.to_thread(self.extract_from_abstract, paper, question)
+                    return (paper.paper_id, entities, relations)
+
+            tasks = [asyncio.create_task(_one(p)) for p in papers]
+            return await asyncio.gather(*tasks)
+
+        try:
+            return asyncio.run(_runner())
+        except RuntimeError:
+            # Fallback for environments where an event loop is already running.
+            with ThreadPoolExecutor(max_workers=max(1, max_concurrency)) as executor:
+                futures = {executor.submit(self.extract_from_abstract, p, question): p for p in papers}
+                out: List[Tuple[str, List[Entity], List[Relation]]] = []
+                for future in as_completed(futures):
+                    paper = futures[future]
+                    entities, relations = future.result()
+                    out.append((paper.paper_id, entities, relations))
+                return out
+
     def extract_from_abstract(
         self, paper: Paper, question: str = ""
     ) -> Tuple[List[Entity], List[Relation]]:
@@ -276,8 +336,14 @@ class EntityExtractor:
             )
             return [], []
 
-        full_prompt = self.build_extraction_prompt(paper.abstract, question)
-        raw_text = self._call_llm_with_retries(full_prompt, max_tokens=1024, call_kind="full", paper_id=paper.paper_id)
+        # Truncate abstract to 1 500 characters before building the prompt.
+        # Abstracts longer than this rarely add extraction value but consume
+        # extra tokens, increasing TPM usage and rate-limit pressure.
+        abstract_text = paper.abstract.strip()[:1500]
+
+        full_prompt = self.build_extraction_prompt(abstract_text, question)
+        # 600 max_tokens is enough for 8-15 entities + relations in JSON.
+        raw_text = self._call_llm_with_retries(full_prompt, max_tokens=600, call_kind="full", paper_id=paper.paper_id)
         data = self._parse_json(raw_text) if raw_text else None
 
         # Retry once with stricter JSON instructions if parsing fails.
@@ -285,10 +351,10 @@ class EntityExtractor:
             for _ in range(_STRICT_JSON_RETRY_MAX):
                 with self._stats_lock:
                     self._json_retry_count += 1
-                strict_prompt = self.build_strict_extraction_prompt(paper.abstract, question)
+                strict_prompt = self.build_strict_extraction_prompt(abstract_text, question)
                 strict_raw = self._call_llm_with_retries(
                     strict_prompt,
-                    max_tokens=760,
+                    max_tokens=500,
                     call_kind="strict-json",
                     paper_id=paper.paper_id,
                 )
@@ -300,10 +366,10 @@ class EntityExtractor:
         if data is None:
             with self._stats_lock:
                 self._fallback_count += 1
-            fallback_prompt = self.build_fallback_extraction_prompt(paper.abstract, question)
+            fallback_prompt = self.build_fallback_extraction_prompt(abstract_text, question)
             fallback_raw = self._call_llm_with_retries(
                 fallback_prompt,
-                max_tokens=420,
+                max_tokens=350,
                 call_kind="fallback",
                 paper_id=paper.paper_id,
             )
@@ -359,6 +425,7 @@ class EntityExtractor:
             question_block = (
                 f"The user is trying to answer: {question}\n"
                 f"IMPORTANT: Extract entities and relations that are directly relevant to this question intent.\n"
+                f"Extract only entities and relations that are directly relevant to the user's query: {question}. Ignore peripheral administrative or tangential scientific data.\n"
                 f"Prioritize terms that explain mechanisms, causes, methods, fixes, outcomes, and constraints when present.\n\n"
             )
 
@@ -366,38 +433,41 @@ class EntityExtractor:
 
 {question_block}Extract ALL entities and relationships from the abstract below.
 
-Entity type guidance:
-- Crop / Organism: biological systems, organisms, populations, agents, targets
-- Disease / Condition: states, conditions, failures, problems, disorders, anomalies
-- Treatment / Method: methods, interventions, techniques, algorithms, controls
-- Environment / Location: contexts, environments, settings, infrastructure, operating conditions
-- Cause / Factor: drivers, causes, risk factors, inputs, constraints
-- Effect / Outcome: outcomes, effects, performance, impacts, metrics
+Entity type guidance (domain-agnostic — use for any scientific field):
+- Concept / Entity: organisms, materials, datasets, models, systems, genes, chemicals, algorithms, compounds
+- Problem / Condition: diseases, failures, risks, deficiencies, anomalies, bottlenecks, disturbances
+- Method / Intervention: techniques, algorithms, treatments, protocols, tools, procedures, experiments
+- Context / Location: environments, regions, platforms, operating conditions, domains, ecosystems, settings
+- Cause / Factor: drivers, risk factors, inputs, stressors, constraints, triggers, predictors
+- Effect / Outcome: results, metrics, impacts, consequences, yields, accuracies, losses, improvements
 
 Relation type guidance:
-- affects: factor/state changes another variable or system behavior
-- treats: method/intervention mitigates condition/problem
+- affects: factor/entity changes another variable or system behaviour
+- mitigates: method/intervention reduces a problem or negative outcome
 - occurs_in: condition/process appears in a context/environment
-- caused_by: condition/outcome attributable to factor(s)
-- leads_to: upstream mechanism produces downstream outcome
-- detected_by: method/signal identifies condition/pattern
-- studied_in: concept is investigated within a context/domain
+- caused_by: condition/outcome attributable to a factor
+- leads_to: upstream cause/mechanism produces a downstream outcome
+- detected_by: entity/condition identified by a method or signal
+- studied_in: concept is investigated within a context or domain
+- correlates_with: statistical or observed co-variation between entities
+- depends_on: entity or process requires another entity/condition
+- part_of: entity is a component or sub-system of another
 
 IMPORTANT: Maximize entity extraction. Include many entities (target 8-15), not just 1-3. Connect related entities with relations.
 
 Return ONLY a valid JSON object in this exact format — no markdown, no explanation, no extra text:
 {{
   "entities": [
-    {{"label": "Wheat", "type": "Crop / Organism"}},
-    {{"label": "Rust", "type": "Disease / Condition"}},
-    {{"label": "Fungus", "type": "Crop / Organism"}},
-    {{"label": "Humid conditions", "type": "Environment / Location"}},
-    {{"label": "Fungicide", "type": "Treatment / Method"}}
+    {{"label": "Wheat", "type": "Concept / Entity"}},
+    {{"label": "Rust disease", "type": "Problem / Condition"}},
+    {{"label": "Puccinia", "type": "Concept / Entity"}},
+    {{"label": "Humid conditions", "type": "Context / Location"}},
+    {{"label": "Fungicide application", "type": "Method / Intervention"}}
   ],
   "relations": [
-    {{"source": "Rust", "target": "Wheat", "relation": "affects"}},
-    {{"source": "Humid conditions", "target": "Rust", "relation": "leads_to"}},
-    {{"source": "Fungicide", "target": "Rust", "relation": "treats"}}
+    {{"source": "Rust disease", "target": "Wheat", "relation": "affects"}},
+    {{"source": "Humid conditions", "target": "Rust disease", "relation": "leads_to"}},
+    {{"source": "Fungicide application", "target": "Rust disease", "relation": "mitigates"}}
   ]
 }}
 
@@ -540,17 +610,28 @@ Abstract:
     ) -> str | None:
         """Call LLM with exponential backoff and jitter, returning None on final failure."""
         client = self._get_client()
+        active_model = self.model
         for attempt in range(_MAX_EXTRACTION_RETRIES):
             try:
                 self.llm_calls += 1
                 response = client.chat.completions.create(
-                    model=self.model,
+                    model=active_model,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.0,
                     max_tokens=max_tokens,
                 )
                 return response.choices[0].message.content.strip()
             except Exception as e:
+                msg = str(e).lower()
+                if "model_decommissioned" in msg or "no longer supported" in msg:
+                    if active_model != self._fallback_model:
+                        logger.warning(
+                            "Extractor model '%s' unavailable; retrying with fallback model '%s'.",
+                            active_model,
+                            self._fallback_model,
+                        )
+                        active_model = self._fallback_model
+                        continue
                 if attempt >= _MAX_EXTRACTION_RETRIES - 1:
                     logger.error(
                         "Groq API error (%s) for paper '%s': %s",
@@ -600,6 +681,25 @@ Abstract:
                 )
             self._client = Groq(api_key=api_key)
         return self._client
+
+    @staticmethod
+    def precheck_model_health(model: str) -> tuple[bool, str]:
+        """Run a minimal request to verify provider model availability."""
+        api_key = os.getenv("GROQ_API_KEY")
+        if not api_key:
+            return False, "GROQ_API_KEY is not set."
+
+        try:
+            client = Groq(api_key=api_key)
+            client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": "health check"}],
+                temperature=0.0,
+                max_tokens=1,
+            )
+            return True, "ok"
+        except Exception as e:
+            return False, str(e)
 
 
 # ---------------------------------------------------------------------------

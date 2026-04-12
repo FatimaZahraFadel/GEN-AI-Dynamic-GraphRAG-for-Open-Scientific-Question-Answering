@@ -24,10 +24,10 @@ st.set_page_config(
 )
 
 NODE_COLORS = {
-    "Crop / Organism": "#2E7D32",
-    "Disease / Condition": "#C62828",
-    "Treatment / Method": "#1565C0",
-    "Environment / Location": "#6A1B9A",
+    "Concept / Entity": "#2E7D32",
+    "Problem / Condition": "#C62828",
+    "Method / Intervention": "#1565C0",
+    "Context / Location": "#6A1B9A",
     "Cause / Factor": "#EF6C00",
     "Effect / Outcome": "#00838F",
     "Unknown": "#546E7A",
@@ -60,12 +60,12 @@ def run_full_pipeline(question: str, top_n: int, top_k: int) -> Dict:
         fast_mode=True,
         session_state=st.session_state["pipeline_session"],
         return_details=True,
+        top_n_override=top_n,
+        top_k_override=top_k,
     )
     total_elapsed = time.perf_counter() - t0
 
-    # Keep a lightweight retrieval cache for UI display only.
-    retrieved_dicts = cached_retrieve_papers(question, details["domain"], top_n=top_n)
-    retrieved_papers = [Paper.from_dict(p) for p in retrieved_dicts]
+    retrieved_papers = details.get("retrieved_papers", [])
 
     # Rebuild entities/relations snapshot from session extraction cache for debug display.
     entities = []
@@ -76,6 +76,13 @@ def run_full_pipeline(question: str, top_n: int, top_k: int) -> Dict:
 
     timings = {
         "total": total_elapsed,
+        "domain_detection": details.get("runtime_metrics", {}).get("domain_detection_seconds", 0.0),
+        "retrieval": details.get("runtime_metrics", {}).get("retrieval_seconds", 0.0),
+        "filtering": details.get("runtime_metrics", {}).get("filtering_seconds", 0.0),
+        "entity_extraction": details.get("runtime_metrics", {}).get("entity_extraction_seconds", 0.0),
+        "graph_build": details.get("runtime_metrics", {}).get("graph_build_seconds", 0.0),
+        "graph_retrieval": details.get("runtime_metrics", {}).get("graph_retrieval_seconds", 0.0),
+        "answer_generation": details.get("runtime_metrics", {}).get("answer_generation_seconds", 0.0),
         "graph_expansion_iters": details.get("expansion_iters", 0),
         "retrieval_skips": details.get("retrieval_skips", 0),
     }
@@ -336,9 +343,77 @@ def render_answer(answer_dict: Dict) -> None:
         return
 
     st.markdown(answer)
-    c1, c2 = st.columns(2)
+    c1, c2, c3 = st.columns(3)
     c1.caption(f"Model: {answer_dict.get('model', 'N/A')}")
     c2.caption(f"Papers used: {answer_dict.get('num_papers_used', 0)}")
+    if answer_dict.get("low_confidence"):
+        c3.caption("Evidence quality: Low")
+    else:
+        c3.caption("Evidence quality: Normal")
+
+
+def render_provenance(
+    answer_dict: Dict,
+    filtered_papers: List[Paper],
+    subgraph: nx.DiGraph,
+    seed_ids: List[str],
+    reasoning_paths: List[List[str]],
+) -> None:
+    """Render an answer provenance panel: cited papers and contributing graph paths."""
+    st.subheader("Answer Provenance")
+
+    answer = answer_dict.get("answer", "")
+
+    # --- Cited papers ---
+    import re as _re
+    cited_titles = _re.findall(r"\[Paper:\s*([^\]]+)\]", answer, flags=_re.IGNORECASE)
+    cited_titles_lower = {t.strip().lower()[:60] for t in cited_titles}
+
+    with st.expander("Papers cited in answer", expanded=True):
+        if not cited_titles:
+            st.info("No explicit [Paper: ...] citations found in the answer.")
+        else:
+            for title in sorted(set(cited_titles)):
+                # Try to match cited title against filtered papers
+                matched = next(
+                    (p for p in filtered_papers if title.strip().lower()[:60] in p.title.lower()[:60]),
+                    None,
+                )
+                if matched:
+                    year = matched.year if matched.year else "Unknown"
+                    st.markdown(f"- **{matched.title}** ({year}) — *{matched.source or 'N/A'}*")
+                else:
+                    st.markdown(f"- {title} *(not matched in retrieved papers)*")
+
+    # --- Papers supporting seed nodes ---
+    with st.expander("Papers supporting key graph nodes", expanded=False):
+        if subgraph.number_of_nodes() == 0 or not filtered_papers:
+            st.info("No graph data available.")
+        else:
+            support_index = build_node_support_index(subgraph, filtered_papers)
+            seen_titles: set = set()
+            for nid in seed_ids[:8]:
+                if nid not in subgraph.nodes:
+                    continue
+                label = subgraph.nodes[nid].get("label", nid)
+                papers_for_node = support_index.get(nid, [])
+                if not papers_for_node:
+                    continue
+                st.markdown(f"**{label}**")
+                for p in papers_for_node[:3]:
+                    if p.title not in seen_titles:
+                        seen_titles.add(p.title)
+                        year = p.year if p.year else "Unknown"
+                        st.markdown(f"  - {p.title} ({year})")
+
+    # --- Reasoning path summary ---
+    with st.expander("Graph reasoning paths used", expanded=False):
+        if not reasoning_paths:
+            st.info("No multi-hop reasoning paths were identified.")
+        else:
+            for i, path in enumerate(reasoning_paths, 1):
+                path_labels = [subgraph.nodes[n].get("label", n) for n in path if n in subgraph.nodes]
+                st.markdown(f"{i}. " + " → ".join(path_labels))
 
 
 def ensure_state() -> None:
@@ -398,7 +473,10 @@ def main() -> None:
         st.caption(
             "Run time: "
             f"{timings.get('total', 0.0):.1f}s total | "
+            f"retrieval {timings.get('retrieval', 0.0):.1f}s | "
+            f"filtering {timings.get('filtering', 0.0):.1f}s | "
             f"entity extraction {timings.get('entity_extraction', 0.0):.1f}s | "
+            f"graph {timings.get('graph_build', 0.0):.1f}s+{timings.get('graph_retrieval', 0.0):.1f}s | "
             f"answer generation {timings.get('answer_generation', 0.0):.1f}s"
         )
 
@@ -472,6 +550,15 @@ def main() -> None:
 
     st.markdown("---")
     render_answer(results["answer_dict"])
+
+    st.markdown("---")
+    render_provenance(
+        answer_dict=results["answer_dict"],
+        filtered_papers=results["filtered_papers"],
+        subgraph=subgraph,
+        seed_ids=seed_ids,
+        reasoning_paths=reasoning_paths,
+    )
 
 
 if __name__ == "__main__":

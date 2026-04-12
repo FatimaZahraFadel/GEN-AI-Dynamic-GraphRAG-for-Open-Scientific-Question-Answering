@@ -118,8 +118,8 @@ class Entity:
         Original human-readable name, e.g. ``"Rust Disease"``.
     type : str
         Entity category.  One of:
-        ``"Crop / Organism"``, ``"Disease / Condition"``,
-        ``"Treatment / Method"``, ``"Environment / Location"``,
+        ``"Concept / Entity"``, ``"Problem / Condition"``,
+        ``"Method / Intervention"``, ``"Context / Location"``,
         ``"Cause / Factor"``, ``"Effect / Outcome"``.
     source_paper_id : str
         ``paper_id`` of the Paper from which this entity was extracted.

@@ -1,5 +1,7 @@
 """Project runtime configuration defaults."""
 
+import os
+
 DOMAINS = [
     "Agriculture",
     "Geoscience",
@@ -8,7 +10,7 @@ DOMAINS = [
     "Environment",
 ]
 
-TOP_N_PAPERS = 25
+TOP_N_PAPERS = 15
 MAX_GRAPH_NODES = 200
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 SPARSE_GRAPH_THRESHOLD = 3
@@ -25,6 +27,10 @@ FAST_MODE_TOP_K_PAPERS = 5
 
 # Entity extraction
 ENTITY_EXTRACTION_MAX_WORKERS = 4
+ENTITY_EXTRACTION_MODEL = os.getenv("ENTITY_EXTRACTION_MODEL", "llama-3.1-8b-instant")
+ENTITY_EXTRACTION_FAST_MODEL = os.getenv("ENTITY_EXTRACTION_FAST_MODEL", "llama-3.1-8b-instant")
+USE_FAST_EXTRACTOR_IN_FAST_MODE = os.getenv("USE_FAST_EXTRACTOR_IN_FAST_MODE", "1") == "1"
+ENTITY_EXTRACTION_MAX_CONCURRENCY = int(os.getenv("ENTITY_EXTRACTION_MAX_CONCURRENCY", "6"))
 
 # Prompt/context budgets
 MAX_CONTEXT_TRIPLES = 30

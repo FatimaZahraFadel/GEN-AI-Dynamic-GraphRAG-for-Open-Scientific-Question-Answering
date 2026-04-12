@@ -101,7 +101,7 @@ class GraphBuilder:
         """
         if graph.number_of_nodes() == 0:
             return
-        self._remove_generic_nodes(graph)
+        self._remove_generic_nodes(graph, question)
         self._add_cooccurrence_edges(graph, min_cooccurrences=2)
         self._add_semantic_bridge_edges(graph, top_k_per_node=2, min_similarity=0.62)
         self._prune_isolated_non_focus_nodes(graph, question)
@@ -319,6 +319,9 @@ class GraphBuilder:
 
     def _canonical_entity_label(self, label: str) -> str:
         t = self._normalize_text(label)
+        # Remove parenthetical acronym tails and trailing short acronym tokens.
+        t = re.sub(r"\([^)]{1,6}\)$", "", t).strip()
+        t = re.sub(r"\b[a-z]{1,2}$", "", t).strip()
         aliases = {
             "wheat rust": "rust",
             "rust disease": "rust",
@@ -333,6 +336,54 @@ class GraphBuilder:
         t = re.sub(r"\b(disease|condition|infection|pathogen|pathogens)\b", "", t).strip()
         t = re.sub(r"\s+", " ", t)
         return t or self._normalize_text(label)
+
+    def _entity_resolution_signature(self, label: str) -> Tuple[str, str]:
+        """
+        Build lexical signatures used for synonym/entity-resolution merging.
+
+        Returns
+        -------
+        tuple[str, str]
+            - token signature: sorted normalised content tokens
+            - abbreviation signature: acronym-like condensed token string
+        """
+        text = self._canonical_entity_label(label)
+        tokens = re.findall(r"\b[a-z][a-z0-9\-]{2,}\b", text)
+        stop = {
+            "based", "using", "system", "method", "methods", "model", "models",
+            "approach", "approaches", "technique", "techniques", "algorithm", "algorithms",
+        }
+        norm_tokens: List[str] = []
+        for tok in tokens:
+            tok = tok.strip("-")
+            if len(tok) <= 2:
+                continue
+            # Simple singularization for plural variants.
+            if len(tok) > 4 and tok.endswith("s") and not tok.endswith("ss"):
+                tok = tok[:-1]
+            if tok and tok not in stop:
+                norm_tokens.append(tok)
+
+        token_sig = " ".join(sorted(set(norm_tokens)))
+        abbr_sig = "".join(t[0] for t in norm_tokens if len(t) > 2)
+        return token_sig, abbr_sig
+
+    def _token_jaccard(self, a: str, b: str) -> float:
+        """Compute token-level Jaccard similarity between two labels."""
+        ta = set(re.findall(r"\b[a-z][a-z0-9\-]{2,}\b", a))
+        tb = set(re.findall(r"\b[a-z][a-z0-9\-]{2,}\b", b))
+        if not ta and not tb:
+            return 0.0
+        return len(ta & tb) / max(len(ta | tb), 1)
+
+    def _token_containment(self, a: str, b: str) -> float:
+        """Containment score: overlap relative to smaller token set."""
+        ta = set(re.findall(r"\b[a-z][a-z0-9\-]{2,}\b", a))
+        tb = set(re.findall(r"\b[a-z][a-z0-9\-]{2,}\b", b))
+        if not ta or not tb:
+            return 0.0
+        inter = len(ta & tb)
+        return inter / max(min(len(ta), len(tb)), 1)
 
     def _normalize_entities_relations(
         self,
@@ -357,17 +408,37 @@ class GraphBuilder:
         before_count = len(entities)
         canonical_to_entity: Dict[str, Entity] = {}
         old_to_new: Dict[str, str] = {}
+        sig_to_id: Dict[str, str] = {}
+        abbr_to_id: Dict[str, str] = {}
 
         for entity in entities:
             canonical = self._canonical_entity_label(entity.label)
-            if canonical not in canonical_to_entity:
+            token_sig, abbr_sig = self._entity_resolution_signature(canonical)
+
+            # First-pass lexical entity resolution: merge by token signature
+            # and acronym-equivalent signature when available.
+            resolved_key = canonical
+            if token_sig and token_sig in sig_to_id:
+                resolved_key = sig_to_id[token_sig]
+            elif abbr_sig and abbr_sig in abbr_to_id:
+                resolved_key = abbr_to_id[abbr_sig]
+
+            if resolved_key not in canonical_to_entity:
                 canonical_to_entity[canonical] = Entity(
                     id=re.sub(r"\s+", "_", canonical),
                     label=canonical,
                     type=entity.type,
                     source_paper_id=entity.source_paper_id,
                 )
-            old_to_new[entity.id] = canonical_to_entity[canonical].id
+                resolved_key = canonical
+
+            rep_id = canonical_to_entity[resolved_key].id
+            old_to_new[entity.id] = rep_id
+
+            if token_sig:
+                sig_to_id[token_sig] = resolved_key
+            if abbr_sig:
+                abbr_to_id[abbr_sig] = resolved_key
 
         merged = list(canonical_to_entity.values())
         if len(merged) > 1:
@@ -396,7 +467,10 @@ class GraphBuilder:
                     if merged[i].type != merged[j].type:
                         continue
                     sim = float(norm_embs[i] @ norm_embs[j])
-                    if sim >= similarity_threshold:
+                    # Merge lexical near-duplicates even when embedding score is noisy.
+                    lex_sim = self._token_jaccard(merged[i].label, merged[j].label)
+                    contain = self._token_containment(merged[i].label, merged[j].label)
+                    if sim >= similarity_threshold or lex_sim >= 0.78 or contain >= 0.90:
                         _union(i, j)
                         merge_count += 1
 
@@ -516,44 +590,65 @@ class GraphBuilder:
         """
         Return True for nodes that represent substantive scientific entities.
         Uses entity type rather than hardcoded domain keywords.
+        Aligned with the domain-agnostic ENTITY_TYPES vocabulary.
         """
         ntype = str(attrs.get("type", ""))
         return ntype in {
-            "Disease / Condition",
+            "Problem / Condition",
             "Cause / Factor",
             "Effect / Outcome",
-            "Treatment / Method",
+            "Method / Intervention",
         }
 
-    def _remove_generic_nodes(self, graph: nx.DiGraph) -> None:
+    def _remove_generic_nodes(self, graph: nx.DiGraph, question: str = "") -> None:
         """
-        Drop overly generic nodes that are isolated from focus nodes.
+        Drop low-relevance isolated nodes using query-similarity rather than a
+        domain-specific hardcoded label list.
 
-        'Generic' is defined by a short fixed list of universal noise labels
-        that appear in any domain (e.g. 'microorganisms', 'bacteria' as
-        stand-alone concepts without any relation to domain focus nodes).
-        Focus nodes are identified by entity type, not by domain keywords.
+        Strategy
+        --------
+        1.  Compute cosine similarity between each node label and the query.
+        2.  A node is a candidate for removal only if it is *isolated from all
+            focus nodes* (i.e. has no focus-node neighbour).
+        3.  Among those candidates, remove the ones whose label similarity to
+            the query falls below a lenient threshold (default 0.15).  This
+            catches truly generic noise ("data", "system", "bacteria") without
+            hard-coding domain vocabulary.
+
+        This approach is fully domain-agnostic: it adapts automatically to any
+        query domain because similarity is computed against the live query text.
         """
-        generic_labels = {
-            "climate change",
-            "microorganisms",
-            "microorganism",
-            "bacteria",
-            "microbes",
-            "soil microbes",
+        if graph.number_of_nodes() == 0 or not question:
+            return
+
+        node_ids = list(graph.nodes())
+        labels = [str(graph.nodes[n].get("label", n)) for n in node_ids]
+        label_embs = self._embedding_service.encode_batch(labels)
+        query_emb = self._embedding_service.encode_text(question)
+
+        # Cosine similarity of each node label to the query
+        q_norm = query_emb / (np.linalg.norm(query_emb) + 1e-10)
+        l_norms = label_embs / (np.linalg.norm(label_embs, axis=1, keepdims=True) + 1e-10)
+        sims = l_norms @ q_norm  # shape (n_nodes,)
+
+        focus_nodes = {
+            nid for nid, attrs in graph.nodes(data=True) if self._is_focus_node(attrs)
         }
-        focus_nodes = {nid for nid, attrs in graph.nodes(data=True) if self._is_focus_node(attrs)}
+
+        _GENERIC_SIM_THRESHOLD = 0.15
         to_remove = []
-
-        for nid, attrs in graph.nodes(data=True):
-            label_n = self._normalize_text(str(attrs.get("label", "")))
-            if label_n not in generic_labels:
+        for i, nid in enumerate(node_ids):
+            if float(sims[i]) >= _GENERIC_SIM_THRESHOLD:
                 continue
             neigh = set(graph.predecessors(nid)) | set(graph.successors(nid))
             if not any(n in focus_nodes for n in neigh):
                 to_remove.append(nid)
 
         if to_remove:
+            logger.info(
+                "_remove_generic_nodes: removing %d low-relevance isolated node(s).",
+                len(to_remove),
+            )
             graph.remove_nodes_from(to_remove)
 
     def _add_semantic_bridge_edges(
@@ -597,7 +692,7 @@ class GraphBuilder:
                     other,
                     relation_type="semantically_related",
                     source_paper_id="semantic_bridge",
-                    edge_weight=round(score, 4),
+                    edge_weight=round(max(0.0, score), 4),
                 )
                 local_added += 1
                 added += 1
@@ -675,8 +770,8 @@ class GraphBuilder:
 
         # Focus types that should always be preserved even if isolated
         focus_types = {
-            "Disease / Condition",
-            "Environment / Location",
+            "Problem / Condition",
+            "Context / Location",
             "Cause / Factor",
         }
 
