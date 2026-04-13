@@ -48,6 +48,7 @@ class GraphBuilder:
         entities: List[Entity],
         relations: List[Relation],
         question: str = "",
+        plan: Dict | None = None,
     ) -> nx.DiGraph:
         """
         Main entry point: create a fresh graph and populate it.
@@ -80,7 +81,7 @@ class GraphBuilder:
 
         self.add_entities(graph, filtered_entities)
         self.add_relations(graph, filtered_relations)
-        self.optimize_for_query(graph, question)
+        self.optimize_for_query(graph, question, plan=plan, query_entities=(plan or {}).get("entities", []))
 
         logger.info(
             f"Graph built: {graph.number_of_nodes()} nodes, "
@@ -88,7 +89,13 @@ class GraphBuilder:
         )
         return graph
 
-    def optimize_for_query(self, graph: nx.DiGraph, question: str) -> None:
+    def optimize_for_query(
+        self,
+        graph: nx.DiGraph,
+        question: str,
+        plan: Dict | None = None,
+        query_entities: List[str] | None = None,
+    ) -> None:
         """
         Apply post-build cleanup and densification steps for query focus.
 
@@ -101,10 +108,17 @@ class GraphBuilder:
         """
         if graph.number_of_nodes() == 0:
             return
-        self._remove_generic_nodes(graph, question)
+        plan = plan or {}
+        query_entities = query_entities or []
+
+        # Prefer a slightly noisy graph over a graph that becomes too small to
+        # support downstream reasoning.
+        if graph.number_of_nodes() > 12:
+            self._remove_generic_nodes(graph, question, plan=plan, query_entities=query_entities)
         self._add_cooccurrence_edges(graph, min_cooccurrences=2)
         self._add_semantic_bridge_edges(graph, top_k_per_node=2, min_similarity=0.62)
-        self._prune_isolated_non_focus_nodes(graph, question)
+        if graph.number_of_nodes() > 12:
+            self._prune_isolated_non_focus_nodes(graph, question, plan=plan, query_entities=query_entities)
 
         n, e = graph.number_of_nodes(), graph.number_of_edges()
         density = e / max(n * (n - 1), 1)
@@ -568,9 +582,12 @@ class GraphBuilder:
             if sim >= adaptive_threshold or direct_match:
                 kept_ids.add(entity.id)
 
-        # Safety net: always keep top-5 most similar entities
-        top5_indices = np.argsort(sims)[::-1][:5]
-        for idx in top5_indices:
+        # Safety net: always keep top-12 most similar entities when available.
+        # This intentionally preserves a richer graph for downstream coverage
+        # validation and answer compilation.
+        keep_top_n = min(12, len(entities))
+        top_indices = np.argsort(sims)[::-1][:keep_top_n]
+        for idx in top_indices:
             kept_ids.add(entities[idx].id)
 
         filtered_entities = [e for e in entities if e.id in kept_ids]
@@ -600,7 +617,38 @@ class GraphBuilder:
             "Method / Intervention",
         }
 
-    def _remove_generic_nodes(self, graph: nx.DiGraph, question: str = "") -> None:
+    def _node_matches_query_entities(self, attrs: Dict, query_entities: List[str]) -> bool:
+        label = self._canonical_entity_label(str(attrs.get("label", "")))
+        query_labels = {self._canonical_entity_label(q) for q in query_entities if q}
+        return bool(label) and label in query_labels
+
+    def should_keep_node(
+        self,
+        graph: nx.DiGraph,
+        node_id: str,
+        plan: Dict | None = None,
+        query_entities: List[str] | None = None,
+    ) -> bool:
+        plan = plan or {}
+        query_entities = query_entities or []
+        attrs = graph.nodes[node_id]
+        node_type = str(attrs.get("type", ""))
+        required_types = set(plan.get("required_entity_types") or [])
+        if node_type in required_types:
+            return True
+        if self._node_matches_query_entities(attrs, query_entities):
+            return True
+        if graph.degree(node_id) >= 2:
+            return True
+        return False
+
+    def _remove_generic_nodes(
+        self,
+        graph: nx.DiGraph,
+        question: str = "",
+        plan: Dict | None = None,
+        query_entities: List[str] | None = None,
+    ) -> None:
         """
         Drop low-relevance isolated nodes using query-similarity rather than a
         domain-specific hardcoded label list.
@@ -618,7 +666,7 @@ class GraphBuilder:
         This approach is fully domain-agnostic: it adapts automatically to any
         query domain because similarity is computed against the live query text.
         """
-        if graph.number_of_nodes() == 0 or not question:
+        if graph.number_of_nodes() <= 12 or not question:
             return
 
         node_ids = list(graph.nodes())
@@ -631,18 +679,19 @@ class GraphBuilder:
         l_norms = label_embs / (np.linalg.norm(label_embs, axis=1, keepdims=True) + 1e-10)
         sims = l_norms @ q_norm  # shape (n_nodes,)
 
-        focus_nodes = {
-            nid for nid, attrs in graph.nodes(data=True) if self._is_focus_node(attrs)
-        }
-
         _GENERIC_SIM_THRESHOLD = 0.15
         to_remove = []
         for i, nid in enumerate(node_ids):
             if float(sims[i]) >= _GENERIC_SIM_THRESHOLD:
                 continue
+            if self.should_keep_node(graph, nid, plan=plan, query_entities=query_entities):
+                continue
             neigh = set(graph.predecessors(nid)) | set(graph.successors(nid))
-            if not any(n in focus_nodes for n in neigh):
-                to_remove.append(nid)
+            if any(self.should_keep_node(graph, n, plan=plan, query_entities=query_entities) for n in neigh):
+                continue
+            if graph.number_of_nodes() - len(to_remove) <= 12:
+                break
+            to_remove.append(nid)
 
         if to_remove:
             logger.info(
@@ -758,30 +807,33 @@ class GraphBuilder:
                 "(min_cooccurrences=%d).", added, min_cooccurrences,
             )
 
-    def _prune_isolated_non_focus_nodes(self, graph: nx.DiGraph, question: str) -> None:
+    def _prune_isolated_non_focus_nodes(
+        self,
+        graph: nx.DiGraph,
+        question: str,
+        plan: Dict | None = None,
+        query_entities: List[str] | None = None,
+    ) -> None:
         """
         Remove isolated (degree-0) nodes that are not query-relevant.
 
         Uses query token matching and entity type instead of hardcoded domain
         keyword lists — making this fully domain-agnostic.
         """
+        plan = plan or {}
+        query_entities = query_entities or []
+
         # Focus on tokens from the query itself (domain-agnostic)
         q_tokens = {tok for tok in self._normalize_text(question).split() if len(tok) > 3}
-
-        # Focus types that should always be preserved even if isolated
-        focus_types = {
-            "Problem / Condition",
-            "Context / Location",
-            "Cause / Factor",
-        }
 
         to_remove = []
         for nid, attrs in graph.nodes(data=True):
             if graph.degree(nid) > 0:
                 continue
+            if graph.number_of_nodes() - len(to_remove) <= 12:
+                break
             label_n = self._normalize_text(str(attrs.get("label", "")))
-            ntype = str(attrs.get("type", ""))
-            if ntype in focus_types:
+            if self.should_keep_node(graph, nid, plan=plan, query_entities=query_entities):
                 continue
             if any(tok in label_n for tok in q_tokens):
                 continue

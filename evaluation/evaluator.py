@@ -22,6 +22,7 @@ import os
 import re
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from collections import Counter
 from typing import Dict, List, Optional, Tuple
@@ -29,6 +30,14 @@ from typing import Dict, List, Optional, Tuple
 from dotenv import load_dotenv
 from groq import Groq
 import numpy as np
+import requests
+
+from config.settings import (
+    OLLAMA_BASE_URL,
+    OLLAMA_GENERAL_MODEL,
+    OLLAMA_TIMEOUT_SECONDS,
+    USE_OLLAMA_PRIMARY,
+)
 
 load_dotenv()
 
@@ -59,6 +68,9 @@ MODES = {
         "enable_expansion": True,
     },
 }
+
+# Keep default evaluation runs short enough for interactive use.
+DEFAULT_BENCHMARK_LIMIT = 8
 
 # ---------------------------------------------------------------------------
 # Benchmark dataset
@@ -609,6 +621,7 @@ class Evaluator:
         model: str = "llama-3.1-8b-instant",
         temperature: float = 0.2,
         judge_repeats: int = 2,
+        stabilize_eval_extraction: bool = True,
     ) -> None:
         """
         Initialise the evaluator.
@@ -624,7 +637,60 @@ class Evaluator:
         self.model = model
         self.temperature = temperature
         self._client: Optional[Groq] = None
+        self._use_ollama_primary = USE_OLLAMA_PRIMARY
+        self._ollama_base_url = OLLAMA_BASE_URL.rstrip("/")
+        self._ollama_model = OLLAMA_GENERAL_MODEL
+        self._ollama_timeout = OLLAMA_TIMEOUT_SECONDS
         self.judge_repeats = max(1, judge_repeats)
+        self.stabilize_eval_extraction = bool(stabilize_eval_extraction)
+
+    @contextmanager
+    def _stabilize_extraction_for_evaluation(self):
+        """
+        Apply temporary extraction throttles for evaluation runs only.
+
+        This reduces rate-limit churn during long ablation experiments without
+        changing normal application behavior outside this evaluator process.
+        """
+        if not self.stabilize_eval_extraction:
+            yield
+            return
+
+        # Import lazily so regular module loading stays unchanged.
+        import main as main_module
+        import pipeline.entity_extractor as extractor_module
+
+        original_values = {
+            "main_workers": main_module.ENTITY_EXTRACTION_MAX_WORKERS,
+            "main_concurrency": main_module.ENTITY_EXTRACTION_MAX_CONCURRENCY,
+            "main_fast_top_n": main_module.FAST_MODE_TOP_N_PAPERS,
+            "main_fast_top_k": main_module.FAST_MODE_TOP_K_PAPERS,
+            "extract_retries": extractor_module._MAX_EXTRACTION_RETRIES,
+            "extract_json_retries": extractor_module._STRICT_JSON_RETRY_MAX,
+            "extract_backoff": extractor_module._BASE_BACKOFF_SECONDS,
+        }
+
+        try:
+            # Keep extraction mostly sequential and reduce retrieval pressure.
+            main_module.ENTITY_EXTRACTION_MAX_WORKERS = 1
+            main_module.ENTITY_EXTRACTION_MAX_CONCURRENCY = 1
+            main_module.FAST_MODE_TOP_N_PAPERS = min(main_module.FAST_MODE_TOP_N_PAPERS, 8)
+            main_module.FAST_MODE_TOP_K_PAPERS = min(main_module.FAST_MODE_TOP_K_PAPERS, 4)
+
+            # Limit repeated extraction calls per paper under rate limits.
+            extractor_module._MAX_EXTRACTION_RETRIES = 1
+            extractor_module._STRICT_JSON_RETRY_MAX = 0
+            extractor_module._BASE_BACKOFF_SECONDS = 0.2
+
+            yield
+        finally:
+            main_module.ENTITY_EXTRACTION_MAX_WORKERS = original_values["main_workers"]
+            main_module.ENTITY_EXTRACTION_MAX_CONCURRENCY = original_values["main_concurrency"]
+            main_module.FAST_MODE_TOP_N_PAPERS = original_values["main_fast_top_n"]
+            main_module.FAST_MODE_TOP_K_PAPERS = original_values["main_fast_top_k"]
+            extractor_module._MAX_EXTRACTION_RETRIES = original_values["extract_retries"]
+            extractor_module._STRICT_JSON_RETRY_MAX = original_values["extract_json_retries"]
+            extractor_module._BASE_BACKOFF_SECONDS = original_values["extract_backoff"]
 
     # ------------------------------------------------------------------
     # Classic RAG baseline
@@ -706,12 +772,13 @@ class Evaluator:
         from main import run_pipeline
         from utils.session_state import SessionState
 
-        details = run_pipeline(
-            query=question,
-            fast_mode=True,
-            session_state=SessionState(),
-            return_details=True,
-        )
+        with self._stabilize_extraction_for_evaluation():
+            details = run_pipeline(
+                query=question,
+                fast_mode=True,
+                session_state=SessionState(),
+                return_details=True,
+            )
         return {
             "answer": details["answer_dict"]["answer"],
             "context": details.get("retrieval", {}).get("context_text", ""),
@@ -743,13 +810,14 @@ class Evaluator:
         else:
             raise ValueError(f"Unsupported GraphRAG mode: {mode}")
 
-        return run_pipeline(
-            query=question,
-            fast_mode=True,
-            session_state=SessionState(),
-            return_details=True,
-            **flags,
-        )
+        with self._stabilize_extraction_for_evaluation():
+            return run_pipeline(
+                query=question,
+                fast_mode=True,
+                session_state=SessionState(),
+                return_details=True,
+                **flags,
+            )
 
     # ------------------------------------------------------------------
     # Metrics — LLM-as-judge
@@ -757,7 +825,7 @@ class Evaluator:
 
     def score_answer(self, answer: str, question: str, context: str) -> Dict[str, int]:
         """
-        Score an answer on three criteria using an LLM judge (1–5 scale).
+        Score an answer on four criteria using an LLM judge (1–5 scale).
 
         The judge evaluates:
 
@@ -767,6 +835,8 @@ class Evaluator:
           explains relationships.
         - **hallucination_resistance** — the answer avoids stating facts not
           present in the provided context (5 = zero hallucination).
+        - **reasoning_trace_quality** — clarity of stepwise reasoning,
+          logical consistency, and use of multi-hop evidence.
 
         Parameters
         ----------
@@ -781,7 +851,8 @@ class Evaluator:
         -------
         dict
             Keys: ``groundedness``, ``reasoning_depth``,
-            ``hallucination_resistance`` — each an integer 1–5.
+            ``hallucination_resistance``, ``reasoning_trace_quality``
+            — each an integer 1–5.
         """
         judge_prompt = (
             f"You are an evaluation judge. Score the following answer "
@@ -845,6 +916,40 @@ class Evaluator:
         averaged["hallucination_resistance"] = averaged["hallucination"]
         averaged["valid"] = int(any(int(s.get("valid", 0)) == 1 for s in score_runs))
         return averaged
+
+    @staticmethod
+    def _judge_to_percent(score_1_to_5: float) -> float:
+        """Map judge scores from 1..5 to 0..100."""
+        value = (float(score_1_to_5) - 1.0) / 4.0 * 100.0
+        return round(max(0.0, min(100.0, value)), 2)
+
+    def _compute_universal_metrics(self, scores: Dict, lexical_metrics: Dict) -> Dict[str, float]:
+        """Compute universal evaluation metrics in a standardized 0..100 scale."""
+        reasoning_j = self._judge_to_percent(scores.get("reasoning", 1))
+        trace_j = self._judge_to_percent(scores.get("reasoning_trace_quality", 1))
+        grounded_j = self._judge_to_percent(scores.get("groundedness", 1))
+        halluc_j = self._judge_to_percent(scores.get("hallucination", 1))
+
+        citation_pct = 100.0 * float(lexical_metrics.get("citation_grounding", 0.0))
+        semantic_pct = 100.0 * float(lexical_metrics.get("semantic_similarity", 0.0))
+        rouge1_pct = 100.0 * float(lexical_metrics.get("rouge1_f1", 0.0))
+        rouge2_pct = 100.0 * float(lexical_metrics.get("rouge2_f1", 0.0))
+        keyword_pct = 100.0 * float(lexical_metrics.get("keyword_coverage", 0.0))
+        length_pct = 100.0 * min(float(lexical_metrics.get("answer_length", 0)) / 220.0, 1.0)
+
+        universal = {
+            "Reasoning": round(0.65 * reasoning_j + 0.35 * trace_j, 2),
+            "Grounding": round(0.65 * grounded_j + 0.35 * citation_pct, 2),
+            "Accuracy": round(0.50 * semantic_pct + 0.25 * rouge1_pct + 0.25 * halluc_j, 2),
+            "Consistency": round(0.70 * halluc_j + 0.30 * grounded_j, 2),
+            "Completeness": round(0.60 * keyword_pct + 0.20 * rouge2_pct + 0.20 * length_pct, 2),
+        }
+        return universal
+
+    def _get_default_benchmark_questions(self) -> List[str]:
+        """Return a reduced benchmark slice for practical runtime in local evaluation."""
+        limit = max(1, min(DEFAULT_BENCHMARK_LIMIT, len(BENCHMARK)))
+        return [b["question"] for b in BENCHMARK[:limit]]
 
     def _normalize_mode_output(self, out: Dict) -> Dict:
         """Ensure each mode output contains required fields with safe defaults."""
@@ -965,6 +1070,7 @@ class Evaluator:
                     "answer_length": len(answer_text.split()),
                     "question_type": meta.get("question_type", "single-hop"),
                 }
+                universal_metrics = self._compute_universal_metrics(scores, lexical_metrics)
                 rows.append(
                     {
                         "mode": mode,
@@ -974,6 +1080,7 @@ class Evaluator:
                         "answer": answer_text,
                         "scores": scores,
                         "lexical_metrics": lexical_metrics,
+                        "universal_metrics": universal_metrics,
                         "metrics": out["metrics"],
                         "graph_metrics": out["graph_metrics"],
                         "confidence": out["confidence"],
@@ -989,6 +1096,10 @@ class Evaluator:
             vals = [float(r["lexical_metrics"][key]) for r in rows if r["mode"] == mode and key in r.get("lexical_metrics", {})]
             return round(sum(vals) / max(len(vals), 1), 4)
 
+        def _uni_avg(mode: str, key: str) -> float:
+            vals = [float(r["universal_metrics"][key]) for r in rows if r["mode"] == mode and key in r.get("universal_metrics", {})]
+            return round(sum(vals) / max(len(vals), 1), 2)
+
         ablation = {
             mode: {
                 "groundedness": _avg(mode, "groundedness"),
@@ -999,6 +1110,17 @@ class Evaluator:
                 "keyword_coverage": _lex_avg(mode, "keyword_coverage"),
                 "semantic_similarity": _lex_avg(mode, "semantic_similarity"),
                 "citation_grounding": _lex_avg(mode, "citation_grounding"),
+            }
+            for mode in MODES.keys()
+        }
+
+        universal = {
+            mode: {
+                "Reasoning": _uni_avg(mode, "Reasoning"),
+                "Grounding": _uni_avg(mode, "Grounding"),
+                "Accuracy": _uni_avg(mode, "Accuracy"),
+                "Consistency": _uni_avg(mode, "Consistency"),
+                "Completeness": _uni_avg(mode, "Completeness"),
             }
             for mode in MODES.keys()
         }
@@ -1056,6 +1178,7 @@ class Evaluator:
 
         return {
             "ablation": ablation,
+            "universal": universal,
             "efficiency": efficiency,
             "correlations": correlations,
             "insights": insights,
@@ -1080,6 +1203,18 @@ class Evaluator:
             for mode, vals in results.get("ablation", {}).items()
         ]
 
+        universal_table = [
+            {
+                "Mode": mode,
+                "Reasoning": vals.get("Reasoning", 0.0),
+                "Grounding": vals.get("Grounding", 0.0),
+                "Accuracy": vals.get("Accuracy", 0.0),
+                "Consistency": vals.get("Consistency", 0.0),
+                "Completeness": vals.get("Completeness", 0.0),
+            }
+            for mode, vals in results.get("universal", {}).items()
+        ]
+
         efficiency_table = [
             {
                 "Mode": mode,
@@ -1097,18 +1232,20 @@ class Evaluator:
         return {
             # map-style outputs requested by final presentation script
             "ablation": results.get("ablation", {}),
+            "universal": results.get("universal", {}),
             "efficiency": results.get("efficiency", {}),
             "correlations": correlations,
             "insights": insights,
             "examples": examples,
             # tabular mirrors for downstream rendering
             "ablation_table": ablation_table,
+            "universal_table": universal_table,
             "efficiency_table": efficiency_table,
         }
 
     def run_research_evaluation(self) -> Dict:
         """One-call runner: load default questions, run ablation, build report."""
-        questions = [b["question"] for b in BENCHMARK]
+        questions = self._get_default_benchmark_questions()
         results = self.run_ablation(questions)
         report = self.generate_report(results)
 
@@ -1139,7 +1276,7 @@ class Evaluator:
     ) -> List[Dict]:
         """Run ablation across classic and GraphRAG variants with efficiency logs."""
         if questions is None:
-            questions = BENCHMARK
+            questions = BENCHMARK[: max(1, min(DEFAULT_BENCHMARK_LIMIT, len(BENCHMARK)))]
         if modes is None:
             modes = ABLATION_MODES
 
@@ -1623,6 +1760,29 @@ class Evaluator:
         str
             Stripped answer text from the LLM.
         """
+        if self._use_ollama_primary:
+            try:
+                response = requests.post(
+                    f"{self._ollama_base_url}/api/generate",
+                    json={
+                        "model": self._ollama_model,
+                        "prompt": prompt,
+                        "stream": False,
+                        "options": {
+                            "temperature": self.temperature,
+                            "num_predict": 512,
+                        },
+                    },
+                    timeout=self._ollama_timeout,
+                )
+                response.raise_for_status()
+                payload = response.json() or {}
+                text = (payload.get("response") or "").strip()
+                if text:
+                    return text
+            except Exception as e:
+                logger.warning("Evaluator Ollama call failed, falling back to Groq: %s", e)
+
         client = self._get_client()
         response = client.chat.completions.create(
             model=self.model,

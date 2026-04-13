@@ -25,7 +25,18 @@ from groq import Groq
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
 
-from config.settings import TOP_N_PAPERS
+from config.settings import (
+    EMBEDDING_MODEL,
+    OLLAMA_BASE_URL,
+    OLLAMA_GENERAL_MODEL,
+    OLLAMA_TIMEOUT_SECONDS,
+    PLAN_AWARE_RETRIEVAL_ALPHA,
+    PLAN_AWARE_RETRIEVAL_BETA,
+    PLAN_AWARE_RETRIEVAL_GAMMA,
+    TOP_N_PAPERS,
+    USE_OLLAMA_PRIMARY,
+)
+from pipeline.embedding_service import EmbeddingService
 
 load_dotenv()
 from models.paper import Paper
@@ -98,6 +109,11 @@ class PaperRetriever:
         self.retrieved_papers_count: int = 0
         self._session = requests.Session()
         self._groq_client: Optional[Groq] = None
+        self._use_ollama_primary = USE_OLLAMA_PRIMARY
+        self._ollama_base_url = OLLAMA_BASE_URL.rstrip("/")
+        self._ollama_model = OLLAMA_GENERAL_MODEL
+        self._ollama_timeout = OLLAMA_TIMEOUT_SECONDS
+        self._embedding_service = EmbeddingService.get_instance(EMBEDDING_MODEL)
         self._query_expansion_cache: dict[str, str] = {}
         self._query_expansion_lock = Lock()
 
@@ -172,7 +188,6 @@ class PaperRetriever:
             return cached
 
         try:
-            client = self._get_groq_client()
             prompt = (
                 "Expand the following question into a dense search query for "
                 "academic paper retrieval. Include:\n"
@@ -188,13 +203,7 @@ class PaperRetriever:
                 "No explanation, no bullet points, no preamble.\n\n"
                 f"Question: {question}"
             )
-            response = client.chat.completions.create(
-                model="llama-3.1-8b-instant",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.2,
-                max_tokens=120,
-            )
-            expanded = response.choices[0].message.content.strip()
+            expanded = self._call_llm(prompt=prompt, temperature=0.2, max_tokens=120)
             if not self._is_expansion_anchored(question, expanded):
                 logger.warning("Query expansion drift detected; falling back to original query.")
                 expanded = question
@@ -208,6 +217,40 @@ class PaperRetriever:
                 self._query_expansion_cache[cache_key] = question
             return question
 
+    def _call_llm(self, prompt: str, temperature: float, max_tokens: int) -> str:
+        """Call Ollama first when enabled, then fall back to Groq."""
+        if self._use_ollama_primary:
+            try:
+                response = self._session.post(
+                    f"{self._ollama_base_url}/api/generate",
+                    json={
+                        "model": self._ollama_model,
+                        "prompt": prompt,
+                        "stream": False,
+                        "options": {
+                            "temperature": temperature,
+                            "num_predict": max_tokens,
+                        },
+                    },
+                    timeout=self._ollama_timeout,
+                )
+                response.raise_for_status()
+                payload = response.json() or {}
+                text = (payload.get("response") or "").strip()
+                if text:
+                    return text
+            except Exception as e:
+                logger.warning("Query expansion Ollama call failed, falling back to Groq: %s", e)
+
+        client = self._get_groq_client()
+        response = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        return response.choices[0].message.content.strip()
+
     def _get_groq_client(self) -> Groq:
         """Return cached Groq client, creating it on first call."""
         if self._groq_client is None:
@@ -217,7 +260,7 @@ class PaperRetriever:
             self._groq_client = Groq(api_key=api_key)
         return self._groq_client
 
-    def get_source_priority(self, domain: str, question: str) -> List[str]:
+    def get_source_priority(self, domain: str, question: str, plan: Optional[dict] = None) -> List[str]:
         """
         Decide retrieval source order based on domain/question keywords.
 
@@ -233,35 +276,76 @@ class PaperRetriever:
         list[str]
             Ordered source keys in priority order.
         """
-        d = (domain or "").lower()
-        q = (question or "").lower()
-        text = f"{d} {q}"
+        # Domain-agnostic routing. Keep broad scientific index first,
+        # then complementary sources for diversity.
+        reasoning_type = (plan or {}).get("type", "")
+        if reasoning_type == "comparison":
+            return ["openalex", "europe_pmc", "arxiv"]
+        if reasoning_type == "method/process":
+            return ["arxiv", "openalex", "europe_pmc"]
+        return ["openalex", "europe_pmc", "arxiv"]
 
-        # Domain-aware routing heuristics.
-        if any(k in text for k in [
-            "agric", "crop", "plant", "fung", "disease", "pathogen",
-            "biolog", "biomed", "medicine", "health", "microb",
-            "environment", "ecolog",
-        ]):
-            return ["europe_pmc", "arxiv", "openalex"]
+    def _intent_alignment_score(self, paper: Paper, plan: Optional[dict]) -> float:
+        if not plan:
+            return 0.0
+        intent_signals = [str(s).lower() for s in (plan.get("intent_signals") or [])]
+        dimensions = [str(d).lower() for d in (plan.get("dimensions") or [])]
+        text = f"{paper.title}. {paper.abstract or ''}".lower()
+        signal_hits = sum(1 for s in intent_signals if s and s in text)
+        dim_hits = sum(1 for d in dimensions if d and d in text)
+        denom = max(len(intent_signals) + len(dimensions), 1)
+        return (signal_hits + dim_hits) / denom
 
-        if any(k in text for k in [
-            "machine learning", "deep learning", "transformer", "llm", "ai",
-            "computer vision", "nlp", "algorithm", "optimization", "theorem",
-            "physics", "math", "quantum",
-        ]):
-            return ["arxiv", "europe_pmc", "openalex"]
+    def _keyword_overlap_score(self, text: str, plan: Optional[dict], question: str) -> float:
+        if not text:
+            return 0.0
+        terms: List[str] = []
+        if plan:
+            terms.extend([str(e).lower() for e in (plan.get("entities") or [])])
+            terms.extend([str(d).lower() for d in (plan.get("dimensions") or [])])
+        if not terms:
+            terms = [tok for tok in re.findall(r"\b[a-z0-9\-]{4,}\b", question.lower()) if tok not in _STOP_WORDS]
+        text_l = text.lower()
+        hits = sum(1 for t in terms if t and t in text_l)
+        return hits / max(len(terms), 1)
 
-        if any(k in text for k in [
-            "geoscience", "earthquake", "tectonic", "climate", "soil",
-            "lithium", "mining", "mineral", "geology", "extraction", "geothermal",
-        ]):
-            return ["europe_pmc", "openalex", "arxiv"]
+    def _rerank_with_plan(self, papers: List[Paper], question: str, plan: Optional[dict]) -> List[Paper]:
+        if not papers:
+            return papers
 
-        # Default robust route.
-        return ["europe_pmc", "arxiv", "openalex"]
+        corpus = [f"{p.title}. {p.abstract or ''}" for p in papers]
+        embeddings = self._embedding_service.encode_batch([question] + corpus)
+        q_emb = embeddings[0]
+        p_embs = embeddings[1:]
 
-    def retrieve(self, question: str, domain: str, expanded_question: Optional[str] = None) -> List[Paper]:
+        q_norm = q_emb / (float((q_emb @ q_emb) ** 0.5) + 1e-10)
+        p_norms = p_embs / ((p_embs**2).sum(axis=1, keepdims=True) ** 0.5 + 1e-10)
+        semantic = (p_norms @ q_norm).astype(float)
+        semantic = (semantic + 1.0) / 2.0
+
+        scored = []
+        for i, paper in enumerate(papers):
+            text = corpus[i]
+            lexical = self._keyword_overlap_score(text=text, plan=plan, question=question)
+            intent = self._intent_alignment_score(paper, plan)
+            hybrid = (
+                PLAN_AWARE_RETRIEVAL_ALPHA * float(semantic[i])
+                + PLAN_AWARE_RETRIEVAL_BETA * lexical
+                + PLAN_AWARE_RETRIEVAL_GAMMA * intent
+            )
+            paper.relevance_score = float(hybrid)
+            scored.append((hybrid, paper))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [p for _, p in scored]
+
+    def retrieve(
+        self,
+        question: str,
+        domain: str,
+        expanded_question: Optional[str] = None,
+        plan: Optional[dict] = None,
+    ) -> List[Paper]:
         """
         Main entry point: retrieve papers relevant to the question and domain.
 
@@ -294,7 +378,7 @@ class PaperRetriever:
         logger.info("Original search query : '%s'", query_original)
         logger.info("Expanded search query : '%s'", query_expanded[:120])
 
-        source_priority = self.get_source_priority(domain, question)
+        source_priority = self.get_source_priority(domain, question, plan=plan)
         logger.info(
             "Source routing for domain '%s': %s",
             domain,
@@ -366,6 +450,7 @@ class PaperRetriever:
                     )
 
         self.retrieved_papers_count += len(all_papers)
+        all_papers = self._rerank_with_plan(all_papers, question=question, plan=plan)
         logger.info(
             "Dual retrieval complete: %d deduplicated papers (original + expanded).",
             len(all_papers),
@@ -395,17 +480,28 @@ class PaperRetriever:
         str
             Space-separated query string ready for API submission.
         """
-        # Tokenise and strip punctuation
+        # Tokenise and strip punctuation, then deduplicate in insertion order.
         tokens = []
+        seen = set()
         for token in question.lower().split():
             clean = "".join(ch for ch in token if ch.isalnum() or ch == "-")
-            if clean and clean not in _STOP_WORDS:
+            if clean and clean not in _STOP_WORDS and clean not in seen:
                 tokens.append(clean)
+                seen.add(clean)
 
-        # Append domain words (also cleaned), avoiding duplicates
+        # Append domain anchor only when informative (avoid generic "general").
         for word in domain.lower().split():
-            if word not in tokens:
+            if word in {"general", "unknown", "none"}:
+                continue
+            if word not in seen:
                 tokens.append(word)
+                seen.add(word)
+
+        # Keep search queries compact to avoid API timeouts from excessively long
+        # boolean expressions (especially for arXiv +AND+ joined terms).
+        max_tokens = 18
+        if len(tokens) > max_tokens:
+            tokens = tokens[:max_tokens]
 
         return " ".join(tokens)
 

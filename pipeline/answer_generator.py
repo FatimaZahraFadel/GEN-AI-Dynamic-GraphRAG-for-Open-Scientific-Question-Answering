@@ -11,6 +11,7 @@ import re
 from typing import Dict, List, Optional
 
 import networkx as nx
+import requests
 from dotenv import load_dotenv
 from groq import Groq
 
@@ -18,7 +19,11 @@ from config.settings import (
     ANSWER_PROMPT_TOKEN_BUDGET,
     MAX_ABSTRACT_TOKENS,
     MAX_CONTEXT_TRIPLES,
+    OLLAMA_BASE_URL,
+    OLLAMA_GENERAL_MODEL,
+    OLLAMA_TIMEOUT_SECONDS,
     SPARSE_GRAPH_THRESHOLD,
+    USE_OLLAMA_PRIMARY,
 )
 from models.paper import Paper
 from utils.helpers import truncate_text
@@ -77,6 +82,10 @@ class AnswerGenerator:
         self.model = model
         self.temperature = temperature
         self._client: Groq | None = None
+        self._use_ollama_primary = USE_OLLAMA_PRIMARY
+        self._ollama_base_url = OLLAMA_BASE_URL.rstrip("/")
+        self._ollama_model = OLLAMA_GENERAL_MODEL
+        self._ollama_timeout = OLLAMA_TIMEOUT_SECONDS
         self.llm_calls: int = 0
 
     # ------------------------------------------------------------------
@@ -88,6 +97,7 @@ class AnswerGenerator:
         question: str,
         context_text: str,
         papers: List[Paper],
+        plan: Optional[Dict] = None,
         subgraph: Optional[nx.DiGraph] = None,
         reasoning_steps: Optional[List[str]] = None,
         reasoning_paths: Optional[List[Dict]] = None,
@@ -142,6 +152,7 @@ class AnswerGenerator:
             question,
             context_text,
             papers,
+            plan=plan or {},
             reasoning_steps=reasoning_steps or [],
             reasoning_paths=reasoning_paths or [],
             intent=intent,
@@ -194,17 +205,6 @@ class AnswerGenerator:
 
         num_papers = min(len(papers), _MAX_PAPERS)
 
-        # Prepend a transparency notice when evidence is limited so that users
-        # know the answer is based on sparse or weakly-connected graph evidence.
-        if low_confidence_mode and answer and not answer.lstrip().startswith("⚠"):
-            n = len(papers)
-            paper_phrase = f"{n} paper{'s' if n != 1 else ''}" if n else "limited papers"
-            answer = (
-                f"⚠ *Limited evidence: this answer is based on {paper_phrase} with "
-                f"a sparse knowledge graph. Treat conclusions with appropriate caution.*\n\n"
-                + answer
-            )
-
         logger.info(
             f"Answer generated ({len(answer)} chars) using "
             f"{num_papers} paper(s) and model '{self.model}'."
@@ -224,6 +224,7 @@ class AnswerGenerator:
         question: str,
         context_text: str,
         papers: List[Paper],
+        plan: Dict | None = None,
         reasoning_steps: List[str] | None = None,
         reasoning_paths: List[Dict] | None = None,
         intent: str = "fact",
@@ -257,6 +258,7 @@ class AnswerGenerator:
         reasoning_steps = reasoning_steps or []
         reasoning_paths = reasoning_paths or []
         evidence_assessment = evidence_assessment or {}
+        plan = plan or {}
 
         context_text = self._select_top_context_triples(
             question=question,
@@ -278,6 +280,7 @@ class AnswerGenerator:
         if not chain_lines:
             chain_lines.append("Step 1: No explicit multi-hop evidence path was found; rely on direct relations.")
         reasoning_chain_block = "\n".join(chain_lines[:6])
+        reasoning_explanations = self._reasoning_paths_to_explanations(reasoning_paths[:5])
 
         # Build the paper evidence block
         selected_papers = papers[:_MAX_PAPERS]
@@ -315,7 +318,8 @@ class AnswerGenerator:
                 "- Confidence is low. Use cautious language, separate strong vs weak evidence, "
                 "and explicitly list uncertainties.\n"
             )
-        effective_mode = self._infer_effective_mode(intent=intent, question=question)
+        plan_type = str(plan.get("type", "")).strip().lower()
+        effective_mode = self._infer_effective_mode(intent=plan_type or intent, question=question)
         min_items = _INTENT_MIN_ITEMS.get(effective_mode, _INTENT_MIN_ITEMS.get(intent, 4))
         intent_instruction = self._build_intent_instruction(intent=effective_mode, min_items=min_items)
 
@@ -327,6 +331,7 @@ Instructions:
 - Answer immediately and directly; do not start with generic filler text.
 - Organize output using clear section headings (## bold) and bullet points appropriate to the question domain.
 - Keep every item concrete and evidence-backed; cite the specific paper or graph triple that supports it.
+- Base explanations on graph reasoning paths, not only abstract summaries.
 - Cite supporting papers using the format [Paper: <title>] when you draw from them.
 - Use terminology that appears in Graph Context, Candidate Evidence Terms, or Supporting Papers; do not invent entities.
 - Do not speculate beyond what the context supports.
@@ -340,6 +345,9 @@ QUESTION:
 ---
 REASONING CHAIN (controller guidance):
 {reasoning_chain_block}
+
+REASONING EXPLANATIONS (path-to-language):
+{reasoning_explanations}
 
 ---
 GRAPH CONTEXT (knowledge graph triples extracted from scientific literature):
@@ -372,6 +380,24 @@ ANSWER:"""
             f"{len(context_text)} chars of graph context."
         )
         return prompt
+
+    def _reasoning_paths_to_explanations(self, reasoning_paths: List[Dict]) -> str:
+        """Convert graph paths into explicit causal/explanatory sentences."""
+        if not reasoning_paths:
+            return "No multi-hop reasoning path available."
+
+        lines: List[str] = []
+        for idx, path in enumerate(reasoning_paths, 1):
+            labels = path.get("labels", [])
+            if len(labels) < 2:
+                continue
+            if len(labels) == 2:
+                lines.append(f"Path {idx}: {labels[0]} is connected to {labels[1]}.")
+            else:
+                links = [f"{labels[i]} influences {labels[i+1]}" for i in range(len(labels) - 1)]
+                lines.append(f"Path {idx}: " + ", then ".join(links) + ".")
+
+        return "\n".join(lines) if lines else "No multi-hop reasoning path available."
 
     def _select_top_context_triples(
         self,
@@ -486,6 +512,15 @@ ANSWER:"""
     def _infer_effective_mode(self, intent: str, question: str) -> str:
         """Infer stronger answer mode from question wording when needed."""
         q = (question or "").lower()
+        mapped = {
+            "method/process": "process",
+            "causal/mechanism": "cause",
+            "optimization/recommendation": "solution",
+            "comparison": "comparison",
+            "definition": "fact",
+        }
+        if intent in mapped:
+            intent = mapped[intent]
 
         list_signals = [
             "what are", "list", "techniques", "methods", "strategies", "approaches",
@@ -633,8 +668,21 @@ Return only the improved final answer."""
         Exception
             Propagates any Groq API error after logging it.
         """
+        if self._use_ollama_primary:
+            logger.info(
+                "Calling Ollama API (model=%s, temp=%s)...",
+                self._ollama_model,
+                self.temperature,
+            )
+            try:
+                ollama_text = self._call_ollama(prompt)
+                if ollama_text:
+                    return ollama_text
+            except Exception as e:
+                logger.warning("Ollama primary call failed; falling back to Groq: %s", e)
+
         client = self._get_client()
-        logger.info(f"Calling Groq API (model={self.model}, temp={self.temperature})…")
+        logger.info(f"Calling Groq API (model={self.model}, temp={self.temperature})...")
 
         try:
             self.llm_calls += 1
@@ -648,6 +696,29 @@ Return only the improved final answer."""
         except Exception as e:
             logger.error(f"Groq API error during answer generation: {e}")
             raise
+
+    def _call_ollama(self, prompt: str) -> str:
+        """Call local Ollama and return generated text."""
+        self.llm_calls += 1
+        response = requests.post(
+            f"{self._ollama_base_url}/api/generate",
+            json={
+                "model": self._ollama_model,
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "temperature": self.temperature,
+                    "num_predict": 1024,
+                },
+            },
+            timeout=self._ollama_timeout,
+        )
+        response.raise_for_status()
+        payload = response.json() or {}
+        text = (payload.get("response") or "").strip()
+        if not text:
+            raise RuntimeError("Ollama returned an empty response.")
+        return text
 
     def _is_rate_limit_error(self, error: Exception) -> bool:
         """Return True when an exception looks like a provider rate-limit error."""

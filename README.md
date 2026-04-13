@@ -55,9 +55,25 @@ User Query
 
    | Variable | Description |
    |---|---|
-   | `OPENAI_API_KEY` | OpenAI API key for LLM calls |
+    | `GROQ_API_KEY` | Groq API key for extraction/generation |
    | `SEMANTIC_SCHOLAR_API_KEY` | Semantic Scholar API key (optional but recommended) |
    | `OPENALEX_EMAIL` | Your email for OpenAlex polite-pool access |
+
+    Optional local Llama fallback for entity extraction (recommended if you hit Groq 429 limits):
+
+    | Variable | Description |
+    |---|---|
+    | `USE_OLLAMA_EXTRACTION_FALLBACK` | Set to `1` to enable local Ollama fallback |
+    | `OLLAMA_BASE_URL` | Ollama URL (default: `http://localhost:11434`) |
+    | `OLLAMA_EXTRACTION_MODEL` | Local model name (example: `llama3.1:8b`) |
+
+    Optional Ollama-primary mode for planner/retriever/answer/evaluator:
+
+    | Variable | Description |
+    |---|---|
+    | `USE_OLLAMA_PRIMARY` | Set to `1` to call Ollama first across LLM stages |
+    | `OLLAMA_GENERAL_MODEL` | Local model for planner/retriever/answer/judge |
+    | `OLLAMA_TIMEOUT_SECONDS` | Request timeout for Ollama calls |
 
 4. **Run the pipeline**:
 

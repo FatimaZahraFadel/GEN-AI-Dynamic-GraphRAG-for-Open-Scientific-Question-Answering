@@ -20,8 +20,16 @@ from typing import Dict, List, Tuple
 
 from dotenv import load_dotenv
 from groq import Groq
+import requests
 
-from config.settings import ENTITY_EXTRACTION_MAX_WORKERS
+from config.settings import (
+    ENTITY_EXTRACTION_MAX_WORKERS,
+    OLLAMA_BASE_URL,
+    OLLAMA_EXTRACTION_MODEL,
+    OLLAMA_TIMEOUT_SECONDS,
+    USE_OLLAMA_EXTRACTION_FALLBACK,
+    USE_OLLAMA_PRIMARY,
+)
 from models.graph_node import Entity, Relation
 from models.paper import Paper
 from utils.logger import get_logger
@@ -127,6 +135,12 @@ class EntityExtractor:
         self.model = model
         self._fallback_model = "llama-3.1-8b-instant"
         self._client: Groq | None = None
+        self._use_ollama_primary = USE_OLLAMA_PRIMARY
+        self._ollama_fallback_enabled = USE_OLLAMA_EXTRACTION_FALLBACK
+        self._ollama_base_url = OLLAMA_BASE_URL.rstrip("/")
+        self._ollama_model = OLLAMA_EXTRACTION_MODEL
+        self._ollama_timeout = OLLAMA_TIMEOUT_SECONDS
+        self._groq_rate_limited = False
         self.llm_calls: int = 0
         self._stats_lock = Lock()
         self._retry_count: int = 0
@@ -148,6 +162,7 @@ class EntityExtractor:
         self,
         papers: List[Paper],
         question: str = "",
+        plan: Dict | None = None,
         extraction_cache: Dict[str, Tuple[List[Entity], List[Relation]]] | None = None,
         max_workers: int = ENTITY_EXTRACTION_MAX_WORKERS,
         runtime_metrics: Dict[str, float] | None = None,
@@ -214,6 +229,7 @@ class EntityExtractor:
         self._retry_count = 0
         self._json_retry_count = 0
         self._fallback_count = 0
+        self._groq_rate_limited = False
 
         # Parallel extraction for new papers.
         extracted_results: List[Tuple[str, List[Entity], List[Relation]]] = []
@@ -223,11 +239,12 @@ class EntityExtractor:
             extracted_results = self._extract_async_concurrent(
                 papers=papers_to_extract,
                 question=question,
+                plan=plan,
                 max_concurrency=worker_count,
             )
         else:
             for paper in papers_to_extract:
-                entities, relations = self.extract_from_abstract(paper, question)
+                entities, relations = self.extract_from_abstract(paper, question, plan=plan)
                 extracted_results.append((paper.paper_id, entities, relations))
 
         for paper_id, entities, relations in extracted_results:
@@ -276,6 +293,7 @@ class EntityExtractor:
         self,
         papers: List[Paper],
         question: str,
+        plan: Dict | None,
         max_concurrency: int,
     ) -> List[Tuple[str, List[Entity], List[Relation]]]:
         """Run extraction using async scheduling with bounded concurrency."""
@@ -285,7 +303,7 @@ class EntityExtractor:
 
             async def _one(paper: Paper) -> Tuple[str, List[Entity], List[Relation]]:
                 async with sem:
-                    entities, relations = await asyncio.to_thread(self.extract_from_abstract, paper, question)
+                    entities, relations = await asyncio.to_thread(self.extract_from_abstract, paper, question, plan)
                     return (paper.paper_id, entities, relations)
 
             tasks = [asyncio.create_task(_one(p)) for p in papers]
@@ -296,7 +314,7 @@ class EntityExtractor:
         except RuntimeError:
             # Fallback for environments where an event loop is already running.
             with ThreadPoolExecutor(max_workers=max(1, max_concurrency)) as executor:
-                futures = {executor.submit(self.extract_from_abstract, p, question): p for p in papers}
+                futures = {executor.submit(self.extract_from_abstract, p, question, plan): p for p in papers}
                 out: List[Tuple[str, List[Entity], List[Relation]]] = []
                 for future in as_completed(futures):
                     paper = futures[future]
@@ -305,7 +323,7 @@ class EntityExtractor:
                 return out
 
     def extract_from_abstract(
-        self, paper: Paper, question: str = ""
+        self, paper: Paper, question: str = "", plan: Dict | None = None
     ) -> Tuple[List[Entity], List[Relation]]:
         """
         Extract entities and relations from a single paper's abstract.
@@ -341,7 +359,7 @@ class EntityExtractor:
         # extra tokens, increasing TPM usage and rate-limit pressure.
         abstract_text = paper.abstract.strip()[:1500]
 
-        full_prompt = self.build_extraction_prompt(abstract_text, question)
+        full_prompt = self.build_extraction_prompt(abstract_text, question, plan=plan)
         # 600 max_tokens is enough for 8-15 entities + relations in JSON.
         raw_text = self._call_llm_with_retries(full_prompt, max_tokens=600, call_kind="full", paper_id=paper.paper_id)
         data = self._parse_json(raw_text) if raw_text else None
@@ -351,7 +369,7 @@ class EntityExtractor:
             for _ in range(_STRICT_JSON_RETRY_MAX):
                 with self._stats_lock:
                     self._json_retry_count += 1
-                strict_prompt = self.build_strict_extraction_prompt(abstract_text, question)
+                strict_prompt = self.build_strict_extraction_prompt(abstract_text, question, plan=plan)
                 strict_raw = self._call_llm_with_retries(
                     strict_prompt,
                     max_tokens=500,
@@ -366,7 +384,7 @@ class EntityExtractor:
         if data is None:
             with self._stats_lock:
                 self._fallback_count += 1
-            fallback_prompt = self.build_fallback_extraction_prompt(abstract_text, question)
+            fallback_prompt = self.build_fallback_extraction_prompt(abstract_text, question, plan=plan)
             fallback_raw = self._call_llm_with_retries(
                 fallback_prompt,
                 max_tokens=350,
@@ -376,11 +394,11 @@ class EntityExtractor:
             data = self._parse_json(fallback_raw) if fallback_raw else None
 
         if data is None:
-            logger.error(
-                "Extraction failed after retries and fallback for paper '%s'.",
+            logger.warning(
+                "Extraction failed after retries and fallback for paper '%s'; using deterministic heuristic extraction.",
                 paper.paper_id,
             )
-            return [], []
+            return self._heuristic_extract_from_abstract(abstract_text, paper.paper_id, question, plan)
 
         entities = self._parse_entities(data.get("entities", []), paper.paper_id)
         relations = self._parse_relations(
@@ -393,7 +411,7 @@ class EntityExtractor:
         )
         return entities, relations
 
-    def build_extraction_prompt(self, abstract: str, question: str = "") -> str:
+    def build_extraction_prompt(self, abstract: str, question: str = "", plan: Dict | None = None) -> str:
         """
         Build the structured JSON-extraction prompt for the LLM.
 
@@ -420,6 +438,18 @@ class EntityExtractor:
         entity_types_str = ", ".join(f'"{t}"' for t in ENTITY_TYPES)
         relation_types_str = ", ".join(f'"{t}"' for t in RELATION_TYPES)
 
+        reasoning_type = str((plan or {}).get("type", "definition"))
+        required_entity_types = ", ".join((plan or {}).get("required_entity_types", []))
+        required_relation_types = ", ".join((plan or {}).get("required_relation_types", []))
+
+        task_focus = {
+            "method/process": "Prioritize actions, techniques, procedures, and step dependencies.",
+            "causal/mechanism": "Prioritize causes, mechanisms, mediators, and downstream effects.",
+            "comparison": "Prioritize measurable properties, comparative dimensions, and outcomes.",
+            "optimization/recommendation": "Prioritize strategies, constraints, trade-offs, and expected impact.",
+            "definition": "Prioritize core concepts, attributes, and contextual qualifiers.",
+        }.get(reasoning_type, "Prioritize entities and relations most relevant to answering the query.")
+
         question_block = ""
         if question:
             question_block = (
@@ -429,9 +459,16 @@ class EntityExtractor:
                 f"Prioritize terms that explain mechanisms, causes, methods, fixes, outcomes, and constraints when present.\n\n"
             )
 
+        plan_block = (
+            f"Reasoning type: {reasoning_type}\n"
+            f"Extraction focus: {task_focus}\n"
+            f"Required entity types: {required_entity_types or 'none specified'}\n"
+            f"Preferred relation types: {required_relation_types or 'none specified'}\n\n"
+        )
+
         return f"""You are an expert scientific information extraction system.
 
-{question_block}Extract ALL entities and relationships from the abstract below.
+{question_block}{plan_block}Extract ALL entities and relationships from the abstract below.
 
 Entity type guidance (domain-agnostic — use for any scientific field):
 - Concept / Entity: organisms, materials, datasets, models, systems, genes, chemicals, algorithms, compounds
@@ -474,11 +511,12 @@ Return ONLY a valid JSON object in this exact format — no markdown, no explana
 Abstract:
 {abstract}"""
 
-    def build_strict_extraction_prompt(self, abstract: str, question: str = "") -> str:
+    def build_strict_extraction_prompt(self, abstract: str, question: str = "", plan: Dict | None = None) -> str:
         """Build a strict JSON-only extraction prompt for parse-recovery retries."""
         question_line = f"Question: {question}\n" if question else ""
+        reasoning_line = f"Reasoning type: {(plan or {}).get('type', 'definition')}\n"
         return f"""Return ONLY valid minified JSON (no markdown, no prose, no trailing text).
-{question_line}
+{question_line}{reasoning_line}
 Schema:
 {{
   "entities": [{{"label": "...", "type": "..."}}],
@@ -492,11 +530,12 @@ Abstract:
 {abstract}
 """
 
-    def build_fallback_extraction_prompt(self, abstract: str, question: str = "") -> str:
+    def build_fallback_extraction_prompt(self, abstract: str, question: str = "", plan: Dict | None = None) -> str:
         """Build a lightweight fallback extraction prompt with fewer outputs."""
         question_line = f"Question: {question}\n" if question else ""
+        reasoning_line = f"Reasoning type: {(plan or {}).get('type', 'definition')}\n"
         return f"""Extract a minimal, reliable set of entities and relations.
-{question_line}
+{question_line}{reasoning_line}
 Rules:
 - Return only 4-8 high-confidence entities.
 - Return only 0-6 high-confidence relations.
@@ -601,6 +640,106 @@ Abstract:
             return None
         return None
 
+    def _heuristic_extract_from_abstract(
+        self,
+        abstract: str,
+        paper_id: str,
+        question: str = "",
+        plan: Dict | None = None,
+    ) -> Tuple[List[Entity], List[Relation]]:
+        """Deterministic, domain-agnostic fallback extraction from the abstract text."""
+        plan = plan or {}
+        reasoning_type = str(plan.get("type", "definition"))
+
+        def classify_type(phrase: str) -> str:
+            text = phrase.lower()
+            if any(tok in text for tok in ["method", "technique", "process", "approach", "protocol", "procedure", "strategy", "framework", "system", "technology", "tool"]):
+                return "Method / Intervention"
+            if any(tok in text for tok in ["effect", "outcome", "result", "impact", "improvement", "reduction", "yield", "performance", "efficiency", "accuracy", "stability", "selectivity", "quality"]):
+                return "Effect / Outcome"
+            if any(tok in text for tok in ["cause", "factor", "driver", "trigger", "mechanism", "constraint", "input", "stressor"]):
+                return "Cause / Factor"
+            if any(tok in text for tok in ["context", "environment", "condition", "setting", "platform", "region", "domain", "ecosystem"]):
+                return "Context / Location"
+            if reasoning_type in {"method_process", "method/process", "optimization", "optimization/recommendation"}:
+                return "Method / Intervention"
+            return "Concept / Entity"
+
+        def classify_relation(sentence: str) -> str:
+            text = sentence.lower()
+            if any(tok in text for tok in ["leads to", "results in", "causes", "produces", "yields"]):
+                return "leads_to"
+            if any(tok in text for tok in ["reduces", "improves", "increases", "decreases", "enhances", "affects", "changes"]):
+                return "affects"
+            if any(tok in text for tok in ["using", "via", "through", "with", "by"]):
+                return "depends_on"
+            if any(tok in text for tok in ["in ", "within", "under", "during", "in the"]):
+                return "occurs_in"
+            return "correlates_with"
+
+        def slug(text: str) -> str:
+            text = re.sub(r"[^a-z0-9\s-]", " ", text.lower())
+            text = re.sub(r"\s+", " ", text).strip()
+            return re.sub(r"\s", "_", text)
+
+        sentence_candidates = re.split(r"(?<=[.!?])\s+", abstract)
+        phrases: List[str] = []
+        for sentence in sentence_candidates:
+            if len(sentence.strip()) < 20:
+                continue
+            # Grab multi-word phrases that look like entities without relying on domain keywords.
+            chunks = re.findall(r"\b[A-Za-z][A-Za-z0-9\-/]{2,}(?:\s+[A-Za-z][A-Za-z0-9\-/]{2,}){0,4}\b", sentence)
+            for chunk in chunks:
+                cleaned = chunk.strip().strip(",;:()[]{}").strip()
+                if len(cleaned) < 3:
+                    continue
+                phrases.append(cleaned)
+
+        # Deduplicate while preserving order.
+        seen = set()
+        entities: List[Entity] = []
+        for phrase in phrases:
+            key = phrase.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            entities.append(
+                Entity(
+                    id=slug(phrase),
+                    label=phrase,
+                    type=classify_type(phrase),
+                    source_paper_id=paper_id,
+                )
+            )
+            if len(entities) >= 10:
+                break
+
+        relations: List[Relation] = []
+        if len(entities) >= 2:
+            entity_by_label = {e.label.lower(): e for e in entities}
+            for sentence in sentence_candidates:
+                sentence_entities = [e for e in entities if e.label.lower() in sentence.lower()]
+                if len(sentence_entities) < 2:
+                    continue
+                relation_type = classify_relation(sentence)
+                for source, target in zip(sentence_entities[:-1], sentence_entities[1:]):
+                    relations.append(
+                        Relation(
+                            source_id=source.id,
+                            target_id=target.id,
+                            relation_type=relation_type,
+                            source_paper_id=paper_id,
+                        )
+                    )
+
+        logger.info(
+            "Heuristic extraction for paper '%s': %d entities, %d relations.",
+            paper_id,
+            len(entities),
+            len(relations),
+        )
+        return entities, relations
+
     def _call_llm_with_retries(
         self,
         prompt: str,
@@ -609,7 +748,46 @@ Abstract:
         paper_id: str,
     ) -> str | None:
         """Call LLM with exponential backoff and jitter, returning None on final failure."""
-        client = self._get_client()
+        if self._use_ollama_primary and self._can_use_ollama():
+            ollama_text = self._call_ollama(
+                prompt=prompt,
+                max_tokens=max_tokens,
+                paper_id=paper_id,
+                call_kind=call_kind,
+            )
+            if ollama_text:
+                return ollama_text
+            logger.warning(
+                "Ollama primary failed for paper '%s' (%s); falling back to Groq.",
+                paper_id,
+                call_kind,
+            )
+
+        if self._groq_rate_limited and self._can_use_ollama():
+            ollama_text = self._call_ollama(
+                prompt=prompt,
+                max_tokens=max_tokens,
+                paper_id=paper_id,
+                call_kind=call_kind,
+            )
+            if ollama_text:
+                return ollama_text
+
+        try:
+            client = self._get_client()
+        except EnvironmentError as e:
+            if self._can_use_ollama():
+                logger.info(
+                    "Groq unavailable for paper '%s' (%s): %s. Using Ollama fallback model '%s'.",
+                    paper_id,
+                    call_kind,
+                    e,
+                    self._ollama_model,
+                )
+                return self._call_ollama(prompt=prompt, max_tokens=max_tokens, paper_id=paper_id, call_kind=call_kind)
+            logger.error("Groq unavailable and Ollama fallback disabled for paper '%s': %s", paper_id, e)
+            return None
+
         active_model = self.model
         for attempt in range(_MAX_EXTRACTION_RETRIES):
             try:
@@ -623,6 +801,29 @@ Abstract:
                 return response.choices[0].message.content.strip()
             except Exception as e:
                 msg = str(e).lower()
+                if "rate_limit_exceeded" in msg or "tokens per day" in msg or "429" in msg:
+                    self._groq_rate_limited = True
+                    if self._can_use_ollama():
+                        logger.warning(
+                            "Groq rate limit for paper '%s' (%s); enabling extractor circuit breaker and trying Ollama fallback model '%s'.",
+                            paper_id,
+                            call_kind,
+                            self._ollama_model,
+                        )
+                        ollama_text = self._call_ollama(
+                            prompt=prompt,
+                            max_tokens=max_tokens,
+                            paper_id=paper_id,
+                            call_kind=call_kind,
+                        )
+                        if ollama_text:
+                            return ollama_text
+                    logger.warning(
+                        "Groq rate limit for paper '%s' (%s); switching to heuristic extraction.",
+                        paper_id,
+                        call_kind,
+                    )
+                    return None
                 if "model_decommissioned" in msg or "no longer supported" in msg:
                     if active_model != self._fallback_model:
                         logger.warning(
@@ -658,6 +859,53 @@ Abstract:
                 time.sleep(wait_seconds)
 
         return None
+
+    def _can_use_ollama(self) -> bool:
+        """Whether local Ollama fallback is enabled by configuration."""
+        return bool((self._use_ollama_primary or self._ollama_fallback_enabled) and self._ollama_model)
+
+    def _call_ollama(
+        self,
+        prompt: str,
+        max_tokens: int,
+        paper_id: str,
+        call_kind: str,
+    ) -> str | None:
+        """Call local Ollama /api/generate and return generated text or None."""
+        try:
+            self.llm_calls += 1
+            resp = requests.post(
+                f"{self._ollama_base_url}/api/generate",
+                json={
+                    "model": self._ollama_model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "temperature": 0.0,
+                        "num_predict": max_tokens,
+                    },
+                },
+                timeout=self._ollama_timeout,
+            )
+            resp.raise_for_status()
+            payload = resp.json() or {}
+            text = (payload.get("response") or "").strip()
+            if text:
+                return text
+            logger.warning(
+                "Ollama returned empty response for paper '%s' (%s).",
+                paper_id,
+                call_kind,
+            )
+            return None
+        except Exception as e:
+            logger.warning(
+                "Ollama fallback failed for paper '%s' (%s): %s",
+                paper_id,
+                call_kind,
+                e,
+            )
+            return None
 
     def _get_client(self) -> Groq:
         """

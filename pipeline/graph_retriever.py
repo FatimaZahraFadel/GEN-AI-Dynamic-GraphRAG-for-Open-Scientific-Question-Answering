@@ -115,6 +115,7 @@ class GraphRetriever:
         self,
         question: str,
         graph: nx.DiGraph,
+        plan: Dict | None = None,
         enable_reasoning_controller: bool = True,
         runtime_metrics: Dict[str, float] | None = None,
     ) -> Dict:
@@ -153,9 +154,10 @@ class GraphRetriever:
             reasoning_paths = self.extract_ranked_paths(subgraph, seed_ids, seed_scores, top_k=5)
             reasoning_steps = self.build_reasoning_steps(question, graph, seed_scores)
 
-        validation = self.validate_subgraph(question, subgraph, reasoning_paths)
+        validation = self.validate_subgraph(question, subgraph, reasoning_paths, plan=plan)
         context_text = self.subgraph_to_text(subgraph, reasoning_paths=reasoning_paths)
         graph_confidence = compute_graph_confidence(subgraph, seed_scores)
+        refinement_hint = self.build_refinement_hint(question=question, plan=plan, validation=validation)
 
         if runtime_metrics is not None:
             runtime_metrics["seed_nodes"] = runtime_metrics.get("seed_nodes", 0) + len(seed_ids)
@@ -191,7 +193,24 @@ class GraphRetriever:
             "num_edges": n_edges,
             "validation": validation,
             "needs_focus_expansion": not validation.get("is_valid", False),
+            "refinement_hint": refinement_hint,
         }
+
+    def build_refinement_hint(self, question: str, plan: Dict | None, validation: Dict) -> str:
+        """Create an adaptive query refinement hint when graph evidence is insufficient."""
+        plan = plan or {}
+        entities = [str(e) for e in (plan.get("entities") or [])]
+        dims = [str(d) for d in (plan.get("dimensions") or [])]
+        intent = " ".join([str(i) for i in (plan.get("intent_signals") or [])]).strip()
+
+        hint_parts = [question]
+        if entities:
+            hint_parts.append("focus entities: " + ", ".join(entities[:4]))
+        if dims:
+            hint_parts.append("analysis dimensions: " + ", ".join(dims[:3]))
+        if intent:
+            hint_parts.append("intent: " + intent)
+        return " | ".join(hint_parts)
 
     def _node_importance(self, graph: nx.DiGraph, nid: str) -> float:
         """
@@ -559,6 +578,7 @@ class GraphRetriever:
         question: str,
         subgraph: nx.DiGraph,
         reasoning_paths: List[Dict],
+        plan: Dict | None = None,
     ) -> Dict:
         """
         Step 10 — Context quality validation (domain-agnostic).
@@ -594,13 +614,80 @@ class GraphRetriever:
             sims = n_norms @ q_norm
             mean_relevance = float(np.mean(sims))
 
+        plan = plan or {}
+        requirements = plan.get("graph_requirements") or {}
+        min_nodes = int(requirements.get("min_nodes", 3))
+        min_edges = int(requirements.get("min_edges", 2))
+        min_entity_types = int(requirements.get("min_entity_types", 1))
+
+        entity_types_present = {attrs.get("type", "Unknown") for _, attrs in subgraph.nodes(data=True)}
+        reasoning_type = str(plan.get("type", "definition"))
+        required_entities = list(plan.get("required_entity_types") or [])
+
+        def _count_matching_types(type_names: List[str]) -> int:
+            return sum(1 for _, attrs in subgraph.nodes(data=True) if str(attrs.get("type", "")) in set(type_names))
+
+        method_types = {"Method / Intervention"}
+        effect_types = {"Effect / Outcome"}
+        concept_types = {"Concept / Entity"}
+        cause_types = {"Cause / Factor"}
+
+        complexity = str(plan.get("complexity", "moderate"))
+        relevance_threshold = 0.20
+        if complexity == "complex":
+            relevance_threshold = 0.16
+        if num_nodes <= 5 or num_edges <= 4:
+            relevance_threshold = min(relevance_threshold, 0.14)
+
+        type_specific_ok = True
+        missing_requirements: List[str] = []
+
+        if reasoning_type in {"method_process", "method/process", "method"}:
+            method_count = _count_matching_types(list(method_types))
+            type_specific_ok = method_count >= 4
+            if not type_specific_ok:
+                missing_requirements.append(f"insufficient_method_nodes:{method_count}")
+        elif reasoning_type == "comparison":
+            plan_entities = [str(e).strip().lower() for e in (plan.get("entities") or []) if str(e).strip()]
+            labels = {str(attrs.get("label", nid)).strip().lower() for nid, attrs in subgraph.nodes(data=True)}
+            type_specific_ok = all(any(entity in label for label in labels) for entity in plan_entities) if plan_entities else len(entity_types_present) >= 2
+            if not type_specific_ok:
+                missing_requirements.append("missing_comparison_entities")
+        elif reasoning_type in {"causal_mechanism", "causal/mechanism", "causal"}:
+            cause_count = _count_matching_types(list(cause_types))
+            effect_count = _count_matching_types(list(effect_types))
+            type_specific_ok = cause_count >= 1 and effect_count >= 1 and has_multihop
+            if not type_specific_ok:
+                missing_requirements.append("missing_causal_chain")
+        elif reasoning_type == "definition":
+            concept_count = _count_matching_types(list(concept_types))
+            type_specific_ok = concept_count >= 1 and len(entity_types_present) >= 2
+            if not type_specific_ok:
+                missing_requirements.append("missing_definition_context")
+        else:
+            type_specific_ok = True
+
         checks = {
             "has_min_nodes": num_nodes >= 3,
             "has_min_edges": num_edges >= 2,
             "has_multihop_paths": has_multihop,
-            "mean_relevance_ok": mean_relevance >= 0.20,
+            "mean_relevance_ok": mean_relevance >= relevance_threshold,
+            "plan_min_nodes": num_nodes >= min_nodes,
+            "plan_min_edges": num_edges >= min_edges,
+            "plan_entity_type_diversity": len(entity_types_present) >= min_entity_types,
+            "plan_type_specific": type_specific_ok,
         }
         is_valid = all(checks.values())
+        if not checks["plan_min_nodes"]:
+            missing_requirements.append("insufficient_nodes")
+        if not checks["plan_min_edges"]:
+            missing_requirements.append("insufficient_edges")
+        if not checks["plan_entity_type_diversity"]:
+            missing_requirements.append("insufficient_entity_type_diversity")
+        if not checks["has_multihop_paths"]:
+            missing_requirements.append("missing_multihop_paths")
+        if not checks["plan_type_specific"] and "plan_type_specific" not in missing_requirements:
+            missing_requirements.append("plan_type_specific")
 
         logger.info(
             "validate_subgraph: nodes=%d edges=%d multihop=%s "
@@ -614,7 +701,9 @@ class GraphRetriever:
             "num_edges": num_edges,
             "has_multihop_paths": has_multihop,
             "mean_relevance": round(mean_relevance, 4),
+            "relevance_threshold": round(relevance_threshold, 4),
             "checks": checks,
+            "missing_requirements": missing_requirements,
             "is_valid": is_valid,
         }
 

@@ -14,7 +14,7 @@ Pipeline stages
 4. EntityExtractor  — extract entities and relations from each paper abstract
 5. GraphBuilder     — build a knowledge graph from extracted entities/relations
 6. GraphRetriever   — retrieve a query-relevant subgraph
-7. AnswerGenerator  — generate a grounded answer conditioned on the subgraph
+7. AnswerGenerator   — generate a grounded LLM answer conditioned on the subgraph
 """
 
 import os
@@ -37,7 +37,6 @@ os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 warnings.filterwarnings("ignore")
 
 # --- Import pipeline stages ---
-from pipeline.domain_detector import DomainDetector
 from pipeline.embedding_service import EmbeddingService
 from pipeline.paper_retriever import PaperRetriever
 from pipeline.paper_filter import PaperFilter
@@ -45,6 +44,15 @@ from pipeline.entity_extractor import EntityExtractor
 from pipeline.graph_builder import GraphBuilder
 from pipeline.graph_retriever import GraphRetriever
 from pipeline.answer_generator import AnswerGenerator
+from pipeline.answer_compiler import compile_answer, assess_graph_quality, CompileResult
+from pipeline.adaptive_retry import (
+    plan_retry_actions,
+    merge_graphs,
+    format_retry_summary,
+)
+from pipeline.domain_detector import DomainDetector
+from pipeline.query_planner import QueryPlanner
+from pipeline.confidence_scorer import score_confidence_and_coverage
 
 # --- Import config ---
 from config.settings import (
@@ -71,6 +79,7 @@ logger = get_logger(__name__)
 _EMBEDDING_SERVICE = EmbeddingService.get_instance(EMBEDDING_MODEL)
 _SESSION_STATE = SessionState()
 _MODEL_HEALTH_CACHE: dict[str, bool] = {}
+_DOMAIN_DETECTOR = DomainDetector(embedding_service=_EMBEDDING_SERVICE)
 
 _ADAPTIVE_ANSWER_TOP_K_TARGET = 7
 _ADAPTIVE_EXTRACTION_SUCCESS_THRESHOLD = 0.80
@@ -250,6 +259,7 @@ def run_pipeline(
         "llm_calls": 0,
         "retrieved_papers": 0,
         "graph_expansion_iterations": 0,
+        "planning_seconds": 0.0,
         "domain_detection_seconds": 0.0,
         "retrieval_seconds": 0.0,
         "filtering_seconds": 0.0,
@@ -272,19 +282,41 @@ def run_pipeline(
     query_embedding = _EMBEDDING_SERVICE.encode_text(query)
 
     # ------------------------------------------------------------------
-    # Stage 1: Domain Detection
+    # Stage 1: Understand + Plan
     # ------------------------------------------------------------------
     t_stage = time.perf_counter()
-    detector = DomainDetector(embedding_service=_EMBEDDING_SERVICE)
-    domain = detector.classify_robust(query)
-    subdomain = detector.classify_subdomain(query, domain)
-    intent = _detect_query_intent(query)
-    runtime_metrics["domain_detection_seconds"] += time.perf_counter() - t_stage
-    logger.info(f"Detected domain: {domain}")
-    logger.info(f"Detected subdomain: {subdomain}")
-    logger.info(f"Detected intent: {intent}")
+    planner = QueryPlanner()
+    plan_obj = planner.plan(query)
+    plan = plan_obj.to_dict()
+    runtime_metrics["planning_seconds"] += time.perf_counter() - t_stage
+    runtime_metrics["llm_calls"] += planner.llm_calls
 
-    retrieval_domain = domain if subdomain == "general" else f"{domain} {subdomain}"
+    plan_type_to_intent = {
+        "definition": "fact",
+        "comparison": "comparison",
+        "method/process": "process",
+        "causal/mechanism": "cause",
+        "optimization/recommendation": "solution",
+    }
+    intent = plan_type_to_intent.get(plan.get("type", "definition"), _detect_query_intent(query))
+
+    t_domain = time.perf_counter()
+    try:
+        domain = _DOMAIN_DETECTOR.classify_robust(query)
+        subdomain = _DOMAIN_DETECTOR.classify_subdomain(query, domain)
+    except Exception as exc:
+        logger.warning("Domain detection failed (%s); falling back to embedding classification.", exc)
+        try:
+            domain = _DOMAIN_DETECTOR.embedding_classify(query)
+            subdomain = domain.lower()
+        except Exception:
+            domain = _DOMAIN_DETECTOR.domains[0] if _DOMAIN_DETECTOR.domains else "general"
+            subdomain = domain.lower()
+    runtime_metrics["domain_detection_seconds"] = time.perf_counter() - t_domain
+    retrieval_domain = domain
+
+    logger.info("Planning completed: type=%s, entities=%d, complexity=%s", plan.get("type"), len(plan.get("entities", [])), plan.get("complexity"))
+    logger.info("Domain detection completed: domain=%s, subdomain=%s", domain, subdomain)
 
     same_domain = session.domain == domain
     reuse_graph = same_domain and session.should_reuse_graph(query_embedding)
@@ -301,6 +333,11 @@ def run_pipeline(
     top_k = top_k_override if top_k_override is not None else (
         FAST_MODE_TOP_K_PAPERS if (fast_mode and reuse_graph) else 10
     )
+    # Adaptive pruning control: reduce over-pruning for complex queries.
+    if plan.get("complexity") == "complex":
+        top_k = max(top_k, 7)
+    elif plan.get("complexity") == "simple":
+        top_k = max(4, min(top_k, 6))
 
     # ------------------------------------------------------------------
     # Stage 2: Paper Retrieval (with LLM query expansion + dual retrieval)
@@ -322,9 +359,16 @@ def run_pipeline(
         # (Step 1 & 2).  We capture the expanded query for logging/expansion
         # loop re-use by creating the retriever once and calling expand_query.
         retriever = PaperRetriever(top_n=top_n, use_query_expansion=True)
-        expanded_query = retriever.expand_query(query)
+        plan_queries = planner.build_retrieval_queries(plan_obj)
+        planning_seed_query = " ".join([query] + plan_queries[:2]).strip()
+        expanded_query = retriever.expand_query(planning_seed_query)
         logger.info("Expanded query for pipeline: '%s'", expanded_query[:120])
-        retrieved_papers = retriever.retrieve(query, retrieval_domain, expanded_question=expanded_query)
+        retrieved_papers = retriever.retrieve(
+            query,
+            retrieval_domain,
+            expanded_question=expanded_query,
+            plan=plan,
+        )
         runtime_metrics["retrieved_papers"] += len(retrieved_papers)
         session.cache_papers(retrieved_papers)
         papers = session.get_cached_papers() if reuse_graph else retrieved_papers
@@ -376,6 +420,7 @@ def run_pipeline(
     entities, relations = extractor.extract(
         filtered_papers,
         question=query,
+        plan=plan,
         extraction_cache=session.extraction_cache,
         max_workers=max(ENTITY_EXTRACTION_MAX_WORKERS, ENTITY_EXTRACTION_MAX_CONCURRENCY),
         runtime_metrics=runtime_metrics,
@@ -412,10 +457,10 @@ def run_pipeline(
         graph = session.graph
         builder.add_entities(graph, entities)
         builder.add_relations(graph, relations)
-        builder.optimize_for_query(graph, query)
+        builder.optimize_for_query(graph, query, plan=plan, query_entities=plan.get("entities", []))
         logger.info("Graph incrementally updated from session cache.")
     else:
-        graph = builder.build(entities, relations, question=query)
+        graph = builder.build(entities, relations, question=query, plan=plan)
 
     logger.info(
         f"Built graph: {graph.number_of_nodes()} nodes, {graph.number_of_edges()} edges"
@@ -430,6 +475,7 @@ def run_pipeline(
     retrieval = graph_retriever.retrieve(
         query,
         graph,
+        plan=plan,
         enable_reasoning_controller=enable_reasoning,
         runtime_metrics=runtime_metrics,
     )
@@ -488,12 +534,19 @@ def run_pipeline(
         )
     )
 
+    validation_state = retrieval.get("validation", {}) or {}
+    confidence_needs_expansion = not bool(validation_state.get("is_valid", False))
+    seen_refinement_queries: set[str] = set()
+
     max_expansion_iters = min(MAX_GRAPH_EXPANSION_ITERS, 2)
     while (
         enable_confidence
         and enable_expansion
         and (
-            retrieval.get("graph_confidence", 0.0) < GRAPH_CONFIDENCE_THRESHOLD
+            (
+                retrieval.get("graph_confidence", 0.0) < GRAPH_CONFIDENCE_THRESHOLD
+                and confidence_needs_expansion
+            )
             or retrieval.get("needs_focus_expansion", False)
         )
         and expansion_iters < max_expansion_iters
@@ -516,7 +569,14 @@ def run_pipeline(
         )
         extra_retriever = PaperRetriever(top_n=LOW_CONFIDENCE_EXTRA_TOP_N)
         t_stage = time.perf_counter()
-        extra_papers = extra_retriever.retrieve(expanded_query, retrieval_domain)
+        refinement_query = retrieval.get("refinement_hint") or expanded_query
+        refinement_key = (refinement_query or "").strip().lower()
+        if refinement_key in seen_refinement_queries:
+            logger.info("Stopping expansion loop: repeated refinement query '%s'.", refinement_query[:100])
+            break
+        seen_refinement_queries.add(refinement_key)
+
+        extra_papers = extra_retriever.retrieve(refinement_query, retrieval_domain, plan=plan)
         runtime_metrics["retrieved_papers"] += len(extra_papers)
         session.cache_papers(extra_papers)
         runtime_metrics["retrieval_seconds"] += time.perf_counter() - t_stage
@@ -536,6 +596,7 @@ def run_pipeline(
         entities, relations = extractor.extract(
             filtered_papers,
             question=expanded_query,
+            plan=plan,
             extraction_cache=session.extraction_cache,
             max_workers=ENTITY_EXTRACTION_MAX_WORKERS,
             runtime_metrics=runtime_metrics,
@@ -545,16 +606,19 @@ def run_pipeline(
         t_stage = time.perf_counter()
         builder.add_entities(graph, entities)
         builder.add_relations(graph, relations)
-        builder.optimize_for_query(graph, expanded_query)
+        builder.optimize_for_query(graph, expanded_query, plan=plan, query_entities=plan.get("entities", []))
         runtime_metrics["graph_build_seconds"] += time.perf_counter() - t_stage
 
         t_stage = time.perf_counter()
         retrieval = graph_retriever.retrieve(
             expanded_query,
             graph,
+            plan=plan,
             enable_reasoning_controller=enable_reasoning,
             runtime_metrics=runtime_metrics,
         )
+        validation_state = retrieval.get("validation", {}) or {}
+        confidence_needs_expansion = not bool(validation_state.get("is_valid", False))
         runtime_metrics["graph_retrieval_seconds"] += time.perf_counter() - t_stage
         expansion_iters += 1
         runtime_metrics["graph_expansion_iterations"] = expansion_iters
@@ -565,15 +629,20 @@ def run_pipeline(
     )
 
     # ------------------------------------------------------------------
-    # Stage 7: Answer Generation
-    # Pass the subgraph so sparse-graph detection can supplement context.
+    # Stage 7: Answer Generation via AnswerGenerator (LLM-grounded)
+    # The graph compiler is used only as a quality/coverage validator.
     # ------------------------------------------------------------------
     t_stage = time.perf_counter()
+
+    # Limit papers to what the generator actually consumes so metrics are truthful.
+    papers_for_answer = filtered_papers_for_answer[:5]
+
     generator = AnswerGenerator()
-    answer_dict = generator.generate(
+    answer_result = generator.generate(
         question=query,
         context_text=retrieval["context_text"],
-        papers=filtered_papers_for_answer,
+        papers=papers_for_answer,
+        plan=plan,
         subgraph=retrieval["subgraph"],
         reasoning_steps=retrieval.get("reasoning_steps", []),
         reasoning_paths=retrieval.get("reasoning_paths", []),
@@ -582,8 +651,27 @@ def run_pipeline(
         low_confidence_mode=low_confidence_mode,
         runtime_metrics=runtime_metrics,
     )
-    runtime_metrics["answer_generation_seconds"] += time.perf_counter() - t_stage
-    logger.info("Answer generated successfully")
+    runtime_metrics["llm_calls"] = runtime_metrics.get("llm_calls", 0) + generator.llm_calls
+    runtime_metrics["answer_generation_seconds"] = time.perf_counter() - t_stage
+
+    # Run the compiler as a validation/quality helper (not the answer source).
+    graph_quality = assess_graph_quality(retrieval["subgraph"], plan)
+
+    logger.info(
+        "Answer generated: model=%s papers=%d graph_quality=%s low_confidence=%s",
+        answer_result.get("model", "unknown"),
+        answer_result.get("num_papers_used", 0),
+        graph_quality,
+        answer_result.get("low_confidence", False),
+    )
+
+    answer_dict = {
+        "answer": answer_result["answer"],
+        "model": answer_result.get("model", "unknown"),
+        "num_papers_used": answer_result.get("num_papers_used", len(papers_for_answer)),
+        "low_confidence": answer_result.get("low_confidence", low_confidence_mode),
+        "quality": graph_quality,
+    }
 
     session.domain = domain
     session.graph = graph
@@ -594,6 +682,14 @@ def run_pipeline(
     runtime_metrics["embedding_calls"] = emb_after["embedding_calls"] - emb_before["embedding_calls"]
     runtime_metrics["embedded_texts"] = emb_after["embedded_texts"] - emb_before["embedded_texts"]
     runtime_metrics["runtime_seconds"] = round(time.perf_counter() - t_start, 4)
+
+    confidence_report = score_confidence_and_coverage(
+        subgraph=retrieval["subgraph"],
+        papers=filtered_papers_for_answer,
+        reasoning_paths=retrieval.get("reasoning_paths", []),
+        seed_scores=retrieval.get("seed_scores", {}),
+        query_plan=plan,
+    )
 
     graph_density = 0.0
     avg_degree = 0.0
@@ -623,9 +719,16 @@ def run_pipeline(
             "density": round(graph_density, 6),
             "avg_degree": round(float(avg_degree), 4),
         },
-        "confidence": float(retrieval.get("graph_confidence", 0.0)),
+        "confidence": float(
+            confidence_report.get("confidence", retrieval.get("graph_confidence", 0.0))
+        ),
+        "coverage": float(
+            confidence_report.get("coverage", 0.0)
+        ),
+        "warnings": confidence_report.get("warnings", []),
         # Extended details for app/evaluator compatibility
         "question": query,
+        "query_plan": plan,
         "expanded_query": expanded_query,
         "domain": domain,
         "subdomain": subdomain,
@@ -640,13 +743,15 @@ def run_pipeline(
         "expansion_iters": expansion_iters,
         "retrieval_skips": retrieval_skips,
         "graph_confidence": retrieval.get("graph_confidence", 0.0),
+        "confidence_report": confidence_report,
         "runtime_metrics": runtime_metrics,
+        "quality": answer_dict.get("quality", "unknown"),
     }
 
     if return_metrics or bool(return_details):
         return result_payload
 
-    return generator.format_answer(answer_dict)
+    return answer_dict["answer"]
 
 
 if __name__ == "__main__":

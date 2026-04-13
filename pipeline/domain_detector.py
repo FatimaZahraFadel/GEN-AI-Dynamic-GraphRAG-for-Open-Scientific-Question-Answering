@@ -13,9 +13,16 @@ from typing import Dict, List
 
 from dotenv import load_dotenv
 from groq import Groq
+import requests
 from sklearn.metrics.pairwise import cosine_similarity
 
-from config.settings import DOMAINS
+from config.settings import (
+    DOMAINS,
+    OLLAMA_BASE_URL,
+    OLLAMA_GENERAL_MODEL,
+    OLLAMA_TIMEOUT_SECONDS,
+    USE_OLLAMA_PRIMARY,
+)
 from pipeline.embedding_service import EmbeddingService
 from utils.logger import get_logger
 
@@ -74,9 +81,11 @@ class DomainDetector:
             "computer vision", "nlp", "hyperparameter", "dataset",
         ],
         "Supply Chain": [
+            "supply chain", "supply chains", "supply chain management",
             "logistics", "inventory", "supplier", "procurement", "warehouse",
             "distribution", "demand", "forecasting", "sourcing", "transport",
             "lead time", "order", "fulfilment", "vendor", "shipment",
+            "delay", "delays", "disruption", "disruptions", "bottleneck",
         ],
         "Environment": [
             "climate", "pollution", "carbon", "biodiversity", "emission",
@@ -103,8 +112,9 @@ class DomainDetector:
             "optimization, algorithms, artificial intelligence, and data-driven systems."
         ),
         "Supply Chain": (
-            "Analysis of logistics networks, inventory management, supplier "
-            "procurement, warehouse distribution, and demand forecasting."
+            "Analysis of supply chain management, logistics networks, inventory "
+            "management, supplier procurement, warehouse distribution, demand "
+            "forecasting, delays, disruptions, and bottlenecks."
         ),
         "Environment": (
             "Investigation of climate change, carbon emissions, air and water "
@@ -130,8 +140,10 @@ class DomainDetector:
         },
         "Supply Chain": {
             "demand planning": ["demand", "forecast", "planning", "inventory", "stockout"],
-            "operations logistics": ["logistics", "warehouse", "shipment", "transport", "lead time"],
-            "procurement risk": ["supplier", "procurement", "sourcing", "risk", "disruption"],
+            "operations logistics": ["logistics", "warehouse", "shipment", "transport", "lead time",
+                                     "supply chain", "delay", "bottleneck", "distribution", "freight"],
+            "procurement risk": ["supplier", "procurement", "sourcing", "risk", "disruption",
+                                 "shortage", "resilience", "contingency"],
         },
         "Environment": {
             "climate impacts": ["climate", "warming", "emissions", "carbon", "mitigation"],
@@ -277,12 +289,12 @@ class DomainDetector:
         """
         Classify a finer-grained subdomain within the predicted top-level domain.
 
-        Falls back to ``"general"`` when confidence is low or no subdomain map
-        exists for the given domain.
+        Falls back to the detected top-level domain when confidence is low or no
+        subdomain map exists for the given domain.
         """
         subdomain_map = self._SUBDOMAIN_KEYWORDS.get(domain, {})
         if not subdomain_map:
-            return "general"
+            return (domain or "general").lower()
 
         q = (question or "").lower()
         scores: Dict[str, int] = {sd: 0 for sd in subdomain_map}
@@ -293,7 +305,7 @@ class DomainDetector:
 
         best_subdomain = max(scores, key=lambda k: scores[k])
         if scores[best_subdomain] == 0:
-            return "general"
+            return (domain or "general").lower()
         return best_subdomain
 
     def llm_classify(self, question: str) -> str:
@@ -313,18 +325,44 @@ class DomainDetector:
         str
             One of the domain labels from ``self.domains``.
         """
-        client = self._get_groq_client()
         prompt = self._build_llm_prompt(question)
 
+        raw = self._call_llm(prompt=prompt, max_tokens=16)
+        return self._normalise_domain(raw)
+
+    def _call_llm(self, prompt: str, max_tokens: int) -> str:
+        """Call Ollama first when enabled, then fall back to Groq."""
+        if USE_OLLAMA_PRIMARY:
+            try:
+                response = requests.post(
+                    f"{OLLAMA_BASE_URL.rstrip('/')}/api/generate",
+                    json={
+                        "model": OLLAMA_GENERAL_MODEL,
+                        "prompt": prompt,
+                        "stream": False,
+                        "options": {
+                            "temperature": 0.0,
+                            "num_predict": max_tokens,
+                        },
+                    },
+                    timeout=OLLAMA_TIMEOUT_SECONDS,
+                )
+                response.raise_for_status()
+                payload = response.json() or {}
+                text = (payload.get("response") or "").strip()
+                if text:
+                    return text
+            except Exception as e:
+                logger.warning("DomainDetector Ollama call failed, falling back to Groq: %s", e)
+
+        client = self._get_groq_client()
         response = client.chat.completions.create(
             model=self.model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0,
-            max_tokens=16,
+            max_tokens=max_tokens,
         )
-
-        raw = response.choices[0].message.content.strip()
-        return self._normalise_domain(raw)
+        return response.choices[0].message.content.strip()
 
     def keyword_classify(self, question: str) -> str:
         """
@@ -459,9 +497,12 @@ class DomainDetector:
             "LLM returned unrecognised domain '%s'; falling back to embedding classification.",
             raw,
         )
-        # Use embedding instead of a hardcoded default so the fallback is
-        # query-sensitive rather than always returning the first domain.
-        return self.embedding_classify(raw if len(raw) > 3 else "general science")
+        # Use embedding on the original query so the fallback is query-sensitive.
+        # If the raw LLM output is too short to be meaningful, fall back to the
+        # first configured domain rather than manufacturing a generic label.
+        if len(raw) > 3:
+            return self.embedding_classify(raw)
+        return self.domains[0] if self.domains else "general"
 
     def _get_groq_client(self) -> Groq:
         """
