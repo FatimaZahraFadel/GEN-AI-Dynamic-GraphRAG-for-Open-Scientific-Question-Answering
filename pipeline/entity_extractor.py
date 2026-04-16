@@ -24,6 +24,7 @@ import requests
 
 from config.settings import (
     ENTITY_EXTRACTION_MAX_WORKERS,
+    ENTITY_EXTRACTION_MODEL,
     OLLAMA_BASE_URL,
     OLLAMA_EXTRACTION_MODEL,
     OLLAMA_TIMEOUT_SECONDS,
@@ -122,7 +123,7 @@ class EntityExtractor:
         Authenticated Groq API client (lazy-initialised on first use).
     """
 
-    def __init__(self, model: str = "llama-3.1-8b-instant") -> None:
+    def __init__(self, model: str = ENTITY_EXTRACTION_MODEL) -> None:
         """
         Initialise the entity extractor.
 
@@ -133,7 +134,7 @@ class EntityExtractor:
             ``"llama3-8b-8192"``.
         """
         self.model = model
-        self._fallback_model = "llama-3.1-8b-instant"
+        self._fallback_model = ENTITY_EXTRACTION_MODEL
         self._client: Groq | None = None
         self._use_ollama_primary = USE_OLLAMA_PRIMARY
         self._ollama_fallback_enabled = USE_OLLAMA_EXTRACTION_FALLBACK
@@ -716,7 +717,6 @@ Abstract:
 
         relations: List[Relation] = []
         if len(entities) >= 2:
-            entity_by_label = {e.label.lower(): e for e in entities}
             for sentence in sentence_candidates:
                 sentence_entities = [e for e in entities if e.label.lower() in sentence.lower()]
                 if len(sentence_entities) < 2:

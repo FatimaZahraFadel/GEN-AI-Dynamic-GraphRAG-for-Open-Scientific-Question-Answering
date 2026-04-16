@@ -33,6 +33,7 @@ from config.settings import (
     PLAN_AWARE_RETRIEVAL_ALPHA,
     PLAN_AWARE_RETRIEVAL_BETA,
     PLAN_AWARE_RETRIEVAL_GAMMA,
+    QUERY_PLANNER_MODEL,
     TOP_N_PAPERS,
     USE_OLLAMA_PRIMARY,
 )
@@ -244,7 +245,7 @@ class PaperRetriever:
 
         client = self._get_groq_client()
         response = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
+            model=QUERY_PLANNER_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=temperature,
             max_tokens=max_tokens,
@@ -534,25 +535,25 @@ class PaperRetriever:
 
         for attempt in range(1, _MAX_RETRIES + 1):
             try:
-                logger.debug(f"Europe PMC request (attempt {attempt}): {params}")
+                logger.debug("Europe PMC request (attempt %d): %s", attempt, params)
                 response = self._session.get(_EPMC_BASE_URL, params=params, timeout=10)
                 response.raise_for_status()
                 data = response.json()
                 papers = self._parse_europe_pmc(data)
-                logger.info(f"Europe PMC: {len(papers)} papers retrieved.")
+                logger.info("Europe PMC: %d papers retrieved.", len(papers))
                 return papers
 
             except requests.exceptions.HTTPError as e:
-                logger.warning(f"Europe PMC HTTP error (attempt {attempt}): {e}")
+                logger.warning("Europe PMC HTTP error (attempt %d): %s", attempt, e)
             except requests.exceptions.ConnectionError as e:
-                logger.warning(f"Europe PMC connection error (attempt {attempt}): {e}")
+                logger.warning("Europe PMC connection error (attempt %d): %s", attempt, e)
             except requests.exceptions.Timeout:
-                logger.warning(f"Europe PMC request timed out (attempt {attempt}).")
+                logger.warning("Europe PMC request timed out (attempt %d).", attempt)
             except Exception as e:
-                logger.error(f"Unexpected error from Europe PMC (attempt {attempt}): {e}")
+                logger.error("Unexpected error from Europe PMC (attempt %d): %s", attempt, e)
 
             if attempt < _MAX_RETRIES:
-                logger.debug(f"Retrying in {_RETRY_DELAY}s…")
+                logger.debug("Retrying in %ds…", _RETRY_DELAY)
                 time.sleep(_RETRY_DELAY)
 
         logger.error("Europe PMC: all retries exhausted.")
@@ -590,24 +591,24 @@ class PaperRetriever:
 
         for attempt in range(1, _MAX_RETRIES + 1):
             try:
-                logger.debug(f"arXiv request (attempt {attempt}): {params}")
+                logger.debug("arXiv request (attempt %d): %s", attempt, params)
                 response = self._session.get(_ARXIV_BASE_URL, params=params, timeout=10)
                 response.raise_for_status()
                 papers = self._parse_arxiv(response.text)
-                logger.info(f"arXiv: {len(papers)} papers retrieved.")
+                logger.info("arXiv: %d papers retrieved.", len(papers))
                 return papers
 
             except requests.exceptions.HTTPError as e:
-                logger.warning(f"arXiv HTTP error (attempt {attempt}): {e}")
+                logger.warning("arXiv HTTP error (attempt %d): %s", attempt, e)
             except requests.exceptions.ConnectionError as e:
-                logger.warning(f"arXiv connection error (attempt {attempt}): {e}")
+                logger.warning("arXiv connection error (attempt %d): %s", attempt, e)
             except requests.exceptions.Timeout:
-                logger.warning(f"arXiv request timed out (attempt {attempt}).")
+                logger.warning("arXiv request timed out (attempt %d).", attempt)
             except Exception as e:
-                logger.error(f"Unexpected error from arXiv (attempt {attempt}): {e}")
+                logger.error("Unexpected error from arXiv (attempt %d): %s", attempt, e)
 
             if attempt < _MAX_RETRIES:
-                logger.debug(f"Retrying in {_RETRY_DELAY}s…")
+                logger.debug("Retrying in %ds…", _RETRY_DELAY)
                 time.sleep(_RETRY_DELAY)
 
         logger.error("arXiv: all retries exhausted.")
@@ -641,25 +642,25 @@ class PaperRetriever:
 
         for attempt in range(1, _MAX_RETRIES + 1):
             try:
-                logger.debug(f"OpenAlex request (attempt {attempt}): {params}")
+                logger.debug("OpenAlex request (attempt %d): %s", attempt, params)
                 response = self._session.get(_OA_BASE_URL, params=params, timeout=10)
                 response.raise_for_status()
                 data = response.json()
                 papers = self._parse_openalex(data)
-                logger.info(f"OpenAlex: {len(papers)} papers retrieved.")
+                logger.info("OpenAlex: %d papers retrieved.", len(papers))
                 return papers
 
             except requests.exceptions.HTTPError as e:
-                logger.warning(f"OpenAlex HTTP error (attempt {attempt}): {e}")
+                logger.warning("OpenAlex HTTP error (attempt %d): %s", attempt, e)
             except requests.exceptions.ConnectionError as e:
-                logger.warning(f"OpenAlex connection error (attempt {attempt}): {e}")
+                logger.warning("OpenAlex connection error (attempt %d): %s", attempt, e)
             except requests.exceptions.Timeout:
-                logger.warning(f"OpenAlex request timed out (attempt {attempt}).")
+                logger.warning("OpenAlex request timed out (attempt %d).", attempt)
             except Exception as e:
-                logger.error(f"Unexpected error from OpenAlex (attempt {attempt}): {e}")
+                logger.error("Unexpected error from OpenAlex (attempt %d): %s", attempt, e)
 
             if attempt < _MAX_RETRIES:
-                logger.debug(f"Retrying in {_RETRY_DELAY}s…")
+                logger.debug("Retrying in %ds…", _RETRY_DELAY)
                 time.sleep(_RETRY_DELAY)
 
         logger.error("OpenAlex: all retries exhausted.")
@@ -833,7 +834,7 @@ class PaperRetriever:
                     source="arxiv",
                 ))
         except ET.ParseError as e:
-            logger.error(f"Error parsing arXiv XML response: {e}")
+            logger.error("Error parsing arXiv XML response: %s", e)
             return []
 
         return papers

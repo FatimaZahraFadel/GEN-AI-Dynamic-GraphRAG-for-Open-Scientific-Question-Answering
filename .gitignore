@@ -21,3 +21,12 @@ dist/
 
 # Evaluation outputs
 evaluation/evaluation_results.json
+
+# LaTeX build artifacts
+*.aux
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.synctex.gz
+*.toc

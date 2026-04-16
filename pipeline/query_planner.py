@@ -31,6 +31,8 @@ from config.settings import (
     OLLAMA_BASE_URL,
     OLLAMA_GENERAL_MODEL,
     OLLAMA_TIMEOUT_SECONDS,
+    QUERY_PLANNER_MODEL,
+    QUERY_PLANNER_TEMPERATURE,
     USE_OLLAMA_PRIMARY,
 )
 
@@ -208,7 +210,7 @@ class QueryPlanner:
     - Answer generation: structure from plan
     """
 
-    def __init__(self, model: str = "llama-3.1-8b-instant") -> None:
+    def __init__(self, model: str = QUERY_PLANNER_MODEL) -> None:
         self.model = model
         self._client: Optional[Groq] = None
         self._use_ollama_primary = USE_OLLAMA_PRIMARY
@@ -288,7 +290,7 @@ class QueryPlanner:
         response = client.chat.completions.create(
             model=self.model,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
+            temperature=QUERY_PLANNER_TEMPERATURE,
             max_tokens=max_tokens,
         )
         return response.choices[0].message.content.strip()

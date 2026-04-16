@@ -253,7 +253,7 @@ def run_pipeline(
     """
 
     logger.info("Starting Dynamic GraphRAG pipeline")
-    logger.info(f"Query: {query}")
+    logger.info("Query: %s", query)
     t_start = time.perf_counter()
     runtime_metrics: dict = {
         "llm_calls": 0,
@@ -376,7 +376,7 @@ def run_pipeline(
 
     retrieved_papers_snapshot = list(papers)
 
-    logger.info(f"Retrieved {len(papers)} candidate papers")
+    logger.info("Retrieved %d candidate papers", len(papers))
     logger.info("[Step 11 diagnostics] original_query='%s'", query[:80])
     logger.info("[Step 11 diagnostics] expanded_query='%s'", expanded_query[:120])
 
@@ -388,7 +388,7 @@ def run_pipeline(
     filtered_papers = paper_filter.filter(papers, query, intent=intent, top_k=top_k)
     evidence_assessment = paper_filter.assess_evidence_consistency(query, filtered_papers)
     runtime_metrics["filtering_seconds"] += time.perf_counter() - t_stage
-    logger.info(f"Filtered to {len(filtered_papers)} papers")
+    logger.info("Filtered to %d papers", len(filtered_papers))
     logger.info(
         "Intent-relevant papers after filter: %d",
         paper_filter.last_intent_relevant_count,
@@ -426,7 +426,7 @@ def run_pipeline(
         runtime_metrics=runtime_metrics,
     )
     runtime_metrics["entity_extraction_seconds"] += time.perf_counter() - t_stage
-    logger.info(f"Extracted {len(entities)} entities, {len(relations)} relations")
+    logger.info("Extracted %d entities, %d relations", len(entities), len(relations))
 
     strict_gate = bool(
         (not evidence_assessment.get("is_consistent", False))

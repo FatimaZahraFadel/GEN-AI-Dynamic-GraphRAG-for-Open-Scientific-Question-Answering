@@ -21,6 +21,7 @@ from config.settings import (
     OLLAMA_BASE_URL,
     OLLAMA_GENERAL_MODEL,
     OLLAMA_TIMEOUT_SECONDS,
+    QUERY_PLANNER_MODEL,
     USE_OLLAMA_PRIMARY,
 )
 from pipeline.embedding_service import EmbeddingService
@@ -155,7 +156,7 @@ class DomainDetector:
     def __init__(
         self,
         domains: List[str] = DOMAINS,
-        model: str = "llama-3.1-8b-instant",
+        model: str = QUERY_PLANNER_MODEL,
         embedding_service: EmbeddingService | None = None,
     ) -> None:
         """

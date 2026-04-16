@@ -36,6 +36,7 @@ from config.settings import (
     OLLAMA_BASE_URL,
     OLLAMA_GENERAL_MODEL,
     OLLAMA_TIMEOUT_SECONDS,
+    QUERY_PLANNER_MODEL,
     USE_OLLAMA_PRIMARY,
 )
 
@@ -618,7 +619,7 @@ class Evaluator:
 
     def __init__(
         self,
-        model: str = "llama-3.1-8b-instant",
+        model: str = QUERY_PLANNER_MODEL,
         temperature: float = 0.2,
         judge_repeats: int = 2,
         stabilize_eval_extraction: bool = True,

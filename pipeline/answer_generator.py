@@ -22,6 +22,7 @@ from config.settings import (
     OLLAMA_BASE_URL,
     OLLAMA_GENERAL_MODEL,
     OLLAMA_TIMEOUT_SECONDS,
+    QUERY_PLANNER_MODEL,
     SPARSE_GRAPH_THRESHOLD,
     USE_OLLAMA_PRIMARY,
 )
@@ -66,7 +67,7 @@ class AnswerGenerator:
 
     def __init__(
         self,
-        model: str = "llama-3.1-8b-instant",
+        model: str = QUERY_PLANNER_MODEL,
         temperature: float = 0.2,
     ) -> None:
         """
@@ -682,7 +683,7 @@ Return only the improved final answer."""
                 logger.warning("Ollama primary call failed; falling back to Groq: %s", e)
 
         client = self._get_client()
-        logger.info(f"Calling Groq API (model={self.model}, temp={self.temperature})...")
+        logger.info("Calling Groq API (model=%s, temp=%s)...", self.model, self.temperature)
 
         try:
             self.llm_calls += 1
@@ -690,11 +691,11 @@ Return only the improved final answer."""
                 model=self.model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=self.temperature,
-                max_tokens=1024,
+                max_tokens=ANSWER_PROMPT_TOKEN_BUDGET,
             )
             return response.choices[0].message.content.strip()
         except Exception as e:
-            logger.error(f"Groq API error during answer generation: {e}")
+            logger.error("Groq API error during answer generation: %s", e)
             raise
 
     def _call_ollama(self, prompt: str) -> str:

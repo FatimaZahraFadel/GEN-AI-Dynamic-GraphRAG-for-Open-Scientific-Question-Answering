@@ -1,0 +1,944 @@
+\documentclass[12pt,a4paper]{article}
+
+% --- Packages ---------------------------------------------------------------
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric,fit,calc}
+\usepackage{float}
+\usepackage{caption}
+\usepackage{parskip}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  citecolor=blue!60!black,
+  urlcolor=blue!60!black,
+}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{blue!70!black}\bfseries,
+  commentstyle=\color{green!50!black}\itshape,
+  stringstyle=\color{red!60!black},
+  breaklines=true,
+  frame=single,
+  rulecolor=\color{gray!40},
+  backgroundcolor=\color{gray!5},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  numbersep=6pt,
+  language=Python,
+  showstringspaces=false,
+}
+
+% --- Title -------------------------------------------------------------------
+\title{%
+  \textbf{Dynamic GraphRAG for Open Scientific Question Answering}\\[0.5em]
+  \large A Graph-Augmented Retrieval System with Confidence-Driven\\
+  Adaptive Expansion and Plan-Aware Pipeline Orchestration%
+}
+\author{Team --- Generative AI, Semester 8}
+\date{April 2026}
+
+\begin{document}
+\maketitle
+\thispagestyle{empty}
+
+% --- Abstract ----------------------------------------------------------------
+\begin{abstract}
+We present Dynamic GraphRAG, a multi-stage retrieval-augmented generation system
+that answers open-ended scientific questions by constructing ephemeral knowledge
+graphs from live academic literature.  Unlike classical RAG pipelines that
+concatenate retrieved passages as flat text, our system extracts typed entities
+and directed relations from paper abstracts, builds a per-query NetworkX
+directed graph, retrieves a query-relevant subgraph via embedding-driven seed
+selection and multi-hop traversal, and conditions the final LLM answer on
+structured graph triples together with paper evidence.  The pipeline is fully
+domain-agnostic, supporting Agriculture, Geoscience, Computer Science, Supply
+Chain, and Environment queries without domain-specific prompts.  A
+confidence-driven adaptive expansion loop re-retrieves papers and re-builds the
+graph when coverage validation fails, bounded to at most two iterations.  An
+LLM-based query planner classifies each question into one of five reasoning
+types and produces a structured plan that shapes retrieval weighting, entity
+extraction priorities, graph validation thresholds, and answer structure.  A
+four-mode ablation evaluation framework with 22 benchmark questions measures
+ROUGE, keyword coverage, semantic similarity, and LLM-as-judge scores across
+progressive feature configurations.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+% =============================================================================
+\section{Introduction}
+% =============================================================================
+
+\subsection{Limitations of Classical RAG}
+
+Retrieval-augmented generation in its simplest form retrieves the top-$k$
+documents for a query and concatenates their text into a flat prompt for a large
+language model.  This approach suffers from several well-known limitations in the
+scientific domain.  First, flat concatenation loses structural relationships
+between entities: if Paper~A states that drought \emph{causes} stomatal closure
+and Paper~B states that stomatal closure \emph{reduces} photosynthesis, a flat
+prompt does not make the causal chain explicit.  Second, relevance ranking
+operates at the document level rather than the concept level, so important
+entities mentioned in lower-ranked papers may be lost.  Third, classical RAG
+provides no mechanism to assess whether the retrieved evidence is sufficient to
+answer a particular type of question (e.g., a comparison question requires at
+least two contrasting concepts).
+
+\subsection{Motivation for GraphRAG}
+
+Graph-based RAG addresses these gaps by introducing an explicit knowledge
+structure between retrieval and generation.  Entities and relations extracted
+from retrieved papers form a directed graph that encodes the relational fabric
+of the evidence.  Subgraph retrieval then selects a query-relevant neighborhood,
+and the LLM receives structured triples rather than raw text.  This enables
+multi-hop reasoning (traversing cause-effect chains), structural validation
+(checking whether required entity types are present), and confidence-driven
+expansion (re-retrieving when the graph is too sparse).
+
+Our system, Dynamic GraphRAG, implements this paradigm end to end with eight
+pipeline stages, a session-aware caching layer, and a confidence-driven
+expansion loop, all orchestrated by an LLM-generated query plan.
+
+% =============================================================================
+\section{System Overview}
+% =============================================================================
+
+The pipeline processes a natural-language scientific question through eight
+sequential stages, each implemented as an independent Python module.  The stages
+communicate through explicit data contracts: each stage receives typed inputs
+and returns typed outputs, with no hidden shared state.  The full pipeline is
+orchestrated by the \texttt{run\_pipeline()} function in \texttt{main.py}.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    stage/.style={
+      rectangle, rounded corners=4pt, draw=blue!60!black, fill=blue!8,
+      minimum width=3.8cm, minimum height=0.9cm, align=center,
+      font=\small\sffamily
+    },
+    arrow/.style={-{Stealth[length=3mm]}, thick, draw=blue!50!black},
+    note/.style={font=\scriptsize\itshape, text=gray!70!black, align=center},
+    node distance=0.55cm
+  ]
+  % Nodes
+  \node[stage]                      (qp)  {Stage 0\\Query Planner};
+  \node[stage, below=of qp]        (dd)  {Stage 1\\Domain Detector};
+  \node[stage, below=of dd]        (pr)  {Stage 2\\Paper Retriever};
+  \node[stage, below=of pr]        (pf)  {Stage 3\\Paper Filter};
+  \node[stage, below=of pf]        (ee)  {Stage 4\\Entity Extractor};
+  \node[stage, below=of ee]        (gb)  {Stage 5\\Graph Builder};
+  \node[stage, below=of gb]        (gr)  {Stage 6\\Graph Retriever};
+  \node[stage, below=of gr]        (ag)  {Stage 7\\Answer Generator};
+
+  % Arrows
+  \draw[arrow] (qp) -- (dd);
+  \draw[arrow] (dd) -- (pr);
+  \draw[arrow] (pr) -- (pf);
+  \draw[arrow] (pf) -- (ee);
+  \draw[arrow] (ee) -- (gb);
+  \draw[arrow] (gb) -- (gr);
+  \draw[arrow] (gr) -- (ag);
+
+  % Side labels
+  \node[note, right=0.7cm of qp] {QueryPlan $\to$ all stages};
+  \node[note, right=0.7cm of pr] {Europe PMC, arXiv, OpenAlex};
+  \node[note, right=0.7cm of ee] {Groq LLM + Ollama fallback};
+  \node[note, right=0.7cm of gb] {NetworkX DiGraph};
+
+  % Expansion loop
+  \draw[arrow, dashed, red!60!black]
+    ($(gr.east)+(0.2,0)$) --
+    ++(1.8,0) node[note, right, text=red!60!black] {Confidence $< \theta$}
+    |- ($(pr.east)+(2.0,0)$) -- (pr.east);
+
+  \node[note, right=3.5cm of pf, text=red!60!black] {Adaptive\\Expansion\\(max 2 iters)};
+
+\end{tikzpicture}
+\caption{Dynamic GraphRAG pipeline with confidence-driven adaptive expansion loop.}
+\label{fig:pipeline}
+\end{figure}
+
+The query plan produced in Stage~0 propagates to every downstream stage:
+it shapes retrieval weighting (Stage~2), entity extraction priorities (Stage~4),
+graph validation thresholds (Stage~6), and answer structure (Stage~7).  If the
+confidence scorer determines that the graph is insufficient after Stage~6,
+the adaptive expansion loop re-enters at Stage~2 with an expanded query, merges
+the new evidence into the existing graph, and re-runs retrieval and answer
+generation.
+
+% =============================================================================
+\section{Architecture}
+% =============================================================================
+
+This section describes each implemented module in detail, based on the actual
+codebase.
+
+% ---------------------------------------------------------------------------
+\subsection{Query Planner (\texttt{query\_planner.py})}
+
+The Query Planner is Stage~0 of the pipeline.  It classifies each incoming
+question into one of five domain-agnostic \emph{reasoning types}: definition,
+comparison, method/process, causal mechanism, or optimization.  Classification
+is performed by an LLM (Groq API, model configurable via
+\texttt{QUERY\_PLANNER\_MODEL}) that returns a structured JSON object
+containing the reasoning type, key entities, comparison dimensions, intent
+signals, and complexity level.
+
+\paragraph{Fallback mechanism.}
+If the LLM call fails or returns unparseable JSON, a heuristic classifier
+activates.  It matches the query against curated keyword patterns (e.g.,
+``what is'' $\to$ definition, ``why'' $\to$ causal\_mechanism) and extracts
+noun-phrase entities via regex.  This ensures every query receives a valid
+\texttt{QueryPlan} regardless of API availability.
+
+\paragraph{Downstream influence.}
+The plan drives every subsequent stage through four dictionaries defined at
+module level:
+\begin{itemize}[nosep]
+  \item \texttt{\_EXTRACTION\_PRIORITIES} --- entity type priorities per
+        reasoning type (e.g., causal questions prioritize Cause/Factor and
+        Effect/Outcome nodes);
+  \item \texttt{\_RELATION\_PRIORITIES} --- relation type priorities;
+  \item \texttt{\_ANSWER\_STRUCTURES} --- output format guidance (e.g.,
+        ``causal\_chain'' for causal questions, ``table\_or\_contrast'' for
+        comparisons);
+  \item \texttt{\_MIN\_GRAPH\_REQUIREMENTS} --- minimum node/edge/type counts
+        per reasoning type, used by coverage validation.
+\end{itemize}
+
+% ---------------------------------------------------------------------------
+\subsection{Domain Detector (\texttt{domain\_detector.py})}
+
+The Domain Detector (Stage~1) classifies the query into one of five supported
+scientific domains: Agriculture, Geoscience, Computer Science, Supply Chain,
+or Environment.  Three interchangeable strategies are implemented:
+
+\begin{enumerate}[nosep]
+  \item \textbf{LLM strategy} --- zero-shot classification via Groq.
+  \item \textbf{Keyword strategy} --- rule-based keyword counting against
+        per-domain dictionaries (18--24 keywords each), with LLM fallback
+        when no domain exceeds the match threshold.
+  \item \textbf{Embedding strategy} --- cosine similarity between the query
+        embedding and per-domain reference sentence embeddings, computed via
+        the shared \texttt{EmbeddingService} singleton.
+\end{enumerate}
+
+The production path uses a robust consensus method
+(\texttt{classify\_robust()}) that runs keyword and embedding strategies in
+parallel and uses agreement to select the final domain.  Subdomain
+classification (e.g., ``crop science'' within Agriculture) is also performed
+for finer retrieval anchoring.
+
+% ---------------------------------------------------------------------------
+\subsection{Paper Retriever (\texttt{paper\_retriever.py})}
+
+Stage~2 fetches candidate papers from three external academic APIs:
+
+\begin{itemize}[nosep]
+  \item \textbf{Europe PMC} --- free, no authentication, strong coverage of
+        life sciences and agriculture;
+  \item \textbf{arXiv} --- preprint server, strong for computer science and
+        physics;
+  \item \textbf{OpenAlex} --- broad interdisciplinary coverage, used as
+        fallback.
+\end{itemize}
+
+\paragraph{Dual retrieval.}
+The retriever issues two parallel queries per source: the original
+domain-anchored query and an LLM-expanded variant.  Query expansion is
+performed by sending the original query to the Groq LLM with a prompt that
+requests alternative phrasing and additional search terms.  Results from both
+passes are deduplicated by paper ID.
+
+\paragraph{Plan-aware reranking.}
+After deduplication, papers are reranked using a weighted combination of
+semantic similarity to the query ($\alpha = 0.6$), keyword overlap with plan
+entities ($\beta = 0.25$), and metadata quality signals such as citation count
+and recency ($\gamma = 0.15$).  These weights are configurable via
+\texttt{config/settings.py}.
+
+\paragraph{Retry logic.}
+Each API call uses a dedicated retry loop with up to three attempts and
+configurable backoff delay.  The HTTP session is configured with
+\texttt{urllib3.util.Retry} for automatic retries on transient HTTP errors
+(429, 500, 502, 503).
+
+\paragraph{Concurrency.}
+Source fetches are parallelized using \texttt{ThreadPoolExecutor} with
+\texttt{as\_completed}, so Europe PMC and arXiv requests execute concurrently
+rather than sequentially.
+
+% ---------------------------------------------------------------------------
+\subsection{Paper Filter (\texttt{paper\_filter.py})}
+
+Stage~3 applies a five-step filtering and ranking pipeline:
+
+\begin{enumerate}[nosep]
+  \item \textbf{Abstract filter} --- removes papers with missing or
+        short ($<50$ characters) abstracts.
+  \item \textbf{Date filter} --- removes papers older than a configurable
+        minimum year.
+  \item \textbf{Relevance ranking} --- computes a hybrid relevance score
+        combining semantic similarity (weight 0.58), lexical keyword coverage
+        (0.18), metadata credibility prior (0.14), and intent alignment
+        (0.10).  Semantic similarity is computed via cosine distance between
+        the query embedding and paper title+abstract embeddings using the
+        shared \texttt{EmbeddingService}.
+  \item \textbf{Adaptive percentile filter} --- removes papers below the
+        60th percentile of the relevance score distribution.  This is
+        purely embedding-driven with no domain-specific keywords.
+  \item \textbf{Truncation} --- returns the top-$k$ papers (default 15,
+        configurable via \texttt{TOP\_N\_PAPERS}).
+\end{enumerate}
+
+An evidence consistency assessment (\texttt{assess\_evidence\_consistency()})
+computes pairwise lexical overlap among filtered papers and a citation
+credibility signal, producing a consistency score used downstream to
+trigger a strict relevance gate when papers disagree.
+
+% ---------------------------------------------------------------------------
+\subsection{Entity Extractor (\texttt{entity\_extractor.py})}
+
+Stage~4 extracts typed entities and directed relations from each paper's
+abstract using an LLM.  The extraction vocabulary is domain-agnostic:
+
+\begin{itemize}[nosep]
+  \item \textbf{Entity types}: Concept/Entity, Problem/Condition,
+        Method/Intervention, Context/Location, Cause/Factor, Effect/Outcome.
+  \item \textbf{Relation types}: affects, mitigates, occurs\_in, caused\_by,
+        leads\_to, detected\_by, studied\_in, correlates\_with, depends\_on,
+        part\_of.
+\end{itemize}
+
+\paragraph{Three-tier LLM fallback.}
+Extraction attempts follow a cascading strategy:
+\begin{enumerate}[nosep]
+  \item \textbf{Full prompt} with structured JSON schema and examples.
+  \item \textbf{Strict JSON retry} with a simplified prompt and explicit
+        format constraints.
+  \item \textbf{Heuristic fallback} using regex-based noun phrase extraction
+        and sentence-level co-occurrence for relations.
+\end{enumerate}
+
+\paragraph{Groq rate-limit circuit breaker.}
+When the Groq API returns a 429 (rate limit) error, the extractor sets an
+internal \texttt{\_groq\_rate\_limited} flag and redirects all subsequent
+extraction calls to the local Ollama endpoint for the remainder of the
+pipeline run.  This avoids cascading failures during bulk extraction.
+
+\paragraph{Concurrent extraction.}
+Papers are processed concurrently using \texttt{ThreadPoolExecutor} with a
+configurable maximum of workers (default 4, controlled by
+\texttt{ENTITY\_EXTRACTION\_MAX\_WORKERS}).  A threading lock protects the
+shared Groq client state.
+
+% ---------------------------------------------------------------------------
+\subsection{Graph Builder (\texttt{graph\_builder.py})}
+
+Stage~5 constructs a fresh \texttt{nx.DiGraph} for each query.  The graph
+is never stored as an instance attribute; it is created inside
+\texttt{build()} and returned explicitly, enforcing per-query isolation.
+
+\paragraph{Entity normalization.}
+Before adding nodes, entities undergo a two-pass normalization:
+\begin{enumerate}[nosep]
+  \item \textbf{Canonical text normalization} --- lowercasing, punctuation
+        stripping, acronym expansion via a small alias map, and
+        token-signature deduplication.
+  \item \textbf{Embedding similarity clustering} --- a union-find structure
+        groups entities of the same type whose embedding cosine similarity
+        exceeds a threshold (default 0.82).  The representative entity with
+        the shortest label is kept.
+\end{enumerate}
+
+\paragraph{Query-aware filtering.}
+Entities are filtered against the query using a combined semantic (0.7)
+and lexical (0.3) score.  Entities below an adaptive threshold (base 0.30)
+are removed, unless doing so would leave fewer than five nodes.
+
+\paragraph{Graph densification.}
+After initial construction, the builder applies three optimization passes:
+\begin{enumerate}[nosep]
+  \item \textbf{Co-occurrence edges} --- entities that co-occur in the same
+        paper abstract at least twice receive an undirected
+        ``co\_occurs\_with'' edge.
+  \item \textbf{Semantic bridge edges} --- for each node, the top-2 most
+        similar other nodes (above cosine similarity 0.62) receive a
+        ``semantically\_related'' edge, connecting otherwise disconnected
+        components.
+  \item \textbf{Isolated node pruning} --- nodes with degree zero that are
+        not query-focused are removed, but only when the graph has more than
+        12 nodes to avoid over-pruning sparse graphs.
+\end{enumerate}
+
+% ---------------------------------------------------------------------------
+\subsection{Graph Retriever (\texttt{graph\_retriever.py})}
+
+Stage~6 extracts the query-relevant subgraph that will be serialized into
+the LLM prompt.
+
+\paragraph{Seed selection.}
+Seed entities are selected using a hybrid score:
+\[
+  \text{score}_i = 0.72 \cdot \text{sim}_i + 0.28 \cdot \text{importance}_i
+                   - 0.20 \cdot \text{hub\_penalty}_i
+\]
+where $\text{sim}_i$ is the cosine similarity between the query embedding and
+node $i$'s label embedding, $\text{importance}_i$ is a normalized degree
+centrality, and $\text{hub\_penalty}_i$ penalizes generic high-degree nodes
+that connect to many unrelated concepts.  The top-5 seeds above a minimum
+similarity threshold of 0.35 are selected.
+
+\paragraph{Subgraph expansion.}
+Seeds are expanded via BFS to a depth of 2 hops using the
+\texttt{GraphBuilder.get\_subgraph()} method.
+
+\paragraph{Multi-hop reasoning paths.}
+The retriever extracts and ranks reasoning paths --- sequences of connected
+triples that form causal or explanatory chains.  Paths are scored by their
+average edge weight and semantic relevance to the query, and the top-5 paths
+are included in the LLM context.
+
+\paragraph{Subgraph validation.}
+The validation step checks whether the subgraph meets the minimum requirements
+specified by the query plan (minimum nodes, edges, and entity type diversity).
+If validation fails, the retrieval result is flagged with
+\texttt{needs\_focus\_expansion = True}, which triggers the adaptive expansion
+loop in \texttt{main.py}.
+
+% ---------------------------------------------------------------------------
+\subsection{Adaptive Retry (\texttt{adaptive\_retry.py})}
+
+The adaptive retry module implements the confidence-driven expansion loop
+that re-enters the pipeline when graph coverage is insufficient.  It provides
+four functions:
+
+\begin{enumerate}[nosep]
+  \item \texttt{expand\_query\_with\_context()} --- analyzes missing
+        requirements (e.g., ``Need $\geq$3 method nodes; found 1'') and
+        appends descriptive keywords to the query targeting the missing
+        entity types.
+  \item \texttt{should\_retry()} --- checks whether the current graph
+        confidence is below the threshold and expansion iterations remain.
+  \item \texttt{merge\_graphs()} --- merges a newly built graph into the
+        existing one, combining nodes and edges while preserving attributes.
+  \item \texttt{format\_retry\_summary()} --- produces a human-readable
+        summary of what changed during expansion.
+\end{enumerate}
+
+The expansion loop in \texttt{main.py} is bounded to a maximum of 2
+iterations (\texttt{MAX\_GRAPH\_EXPANSION\_ITERS}).  A set of seen refinement
+queries prevents infinite loops when the same expanded query is generated
+twice.
+
+% ---------------------------------------------------------------------------
+\subsection{Answer Generator (\texttt{answer\_generator.py})}
+
+Stage~7 assembles a RAG-style prompt from the graph triples, reasoning paths,
+and paper abstracts, then calls the Groq LLM to produce a cited answer.
+
+\paragraph{Sparse graph supplementation.}
+When the retrieved subgraph has fewer edges than
+\texttt{SPARSE\_GRAPH\_THRESHOLD} (default 3), the top-3 paper abstracts are
+appended directly to the context text to ensure the LLM has sufficient
+grounding material.
+
+\paragraph{Intent-specific instructions.}
+The prompt includes intent-aware generation instructions derived from the
+query plan: comparison questions request tabular contrasts, causal questions
+request chain explanations, and optimization questions request ranked
+strategies.
+
+\paragraph{Quality detection and auto-repair.}
+After generation, the answer is checked against quality heuristics (e.g.,
+minimum length, presence of citations, coverage of key entities).  If issues
+are detected, a repair prompt is sent to the LLM requesting targeted
+improvements.
+
+\paragraph{Rate-limit fallback.}
+If the Groq API returns a rate-limit error during answer generation, the
+system produces a deterministic fallback answer assembled from paper abstracts
+and reasoning paths, avoiding a complete pipeline failure.
+
+% ---------------------------------------------------------------------------
+\subsection{Answer Compiler (\texttt{answer\_compiler.py})}
+
+The Answer Compiler (Stage~7b) is a graph-only answer construction module that
+does not use the LLM.  It ranks graph nodes by a composite score combining
+degree centrality, query alignment, and paper support, then builds
+natural-language explanations from graph relations.  Its primary role in the
+production pipeline is as a \emph{quality validator}: the \texttt{CompileResult}
+returned by \texttt{compile\_answer()} includes coverage and confidence scores,
+a list of missing requirements, and a quality assessment
+(``good''/``acceptable''/``insufficient'') that the main orchestrator uses to
+decide whether to trigger adaptive expansion.
+
+% ---------------------------------------------------------------------------
+\subsection{Confidence Scorer (\texttt{confidence\_scorer.py})}
+
+The Confidence Scorer computes a composite confidence score from five signals:
+
+\begin{enumerate}[nosep]
+  \item Graph density (from \texttt{nx.density()});
+  \item Average node degree, normalized as $d/(d+2)$;
+  \item Edge count, normalized as $\min(E/20, 1)$;
+  \item Average seed similarity score;
+  \item Paper support count and reasoning path count.
+\end{enumerate}
+
+The overall confidence is a weighted sum:
+\[
+  C = 0.25 \cdot \text{density} + 0.25 \cdot \text{degree\_norm}
+    + 0.20 \cdot \text{edge\_norm} + 0.30 \cdot \text{seed\_norm}
+\]
+A coverage score is also computed based on how well the graph satisfies the
+plan's entity type and relation type requirements.
+
+% ---------------------------------------------------------------------------
+\subsection{Session State (\texttt{session\_state.py})}
+
+The \texttt{SessionState} dataclass manages per-session caching for the
+Streamlit dashboard, enabling efficient handling of follow-up queries.
+
+\begin{itemize}[nosep]
+  \item \textbf{Graph reuse} --- if the new query's embedding is sufficiently
+        similar to the previous query (cosine similarity $\geq 0.82$), the
+        existing graph is incrementally updated rather than rebuilt from
+        scratch.
+  \item \textbf{Retrieval skip} --- if similarity exceeds 0.93, paper
+        retrieval is skipped entirely and the existing paper cache is reused.
+  \item \textbf{Bounded caches} --- papers and extraction results are stored
+        in \texttt{OrderedDict} instances with maximum sizes of 500 and 300
+        entries respectively, using FIFO eviction.
+  \item \textbf{TTL expiration} --- all cached data expires after 1800
+        seconds (30 minutes) of inactivity.
+\end{itemize}
+
+% =============================================================================
+\section{Key Design Decisions}
+% =============================================================================
+
+\subsection{Dynamic Graphs vs.\ Static Knowledge Bases}
+
+The graph is constructed fresh for every query and discarded after answer
+generation.  No persistent graph database is used (the \texttt{neo4j}
+dependency was identified as unused and removed during the final cleanup).
+This design avoids stale knowledge, ensures that every answer reflects the
+latest literature, and eliminates the operational complexity of maintaining
+a graph database.  The tradeoff is increased latency per query, which is
+mitigated by concurrent API fetches and parallel entity extraction.
+
+\subsection{Domain-Agnostic Entity Vocabulary}
+
+Rather than defining domain-specific entity types (e.g., ``Crop'',
+``Mineral''), the system uses six broad categories (Concept/Entity,
+Problem/Condition, Method/Intervention, Context/Location, Cause/Factor,
+Effect/Outcome) that apply across all five supported domains.  This eliminates
+the need for per-domain extraction prompts and ensures that adding a new
+domain requires only updating the keyword dictionary in the Domain Detector.
+
+\subsection{Confidence-Driven Adaptive Expansion}
+
+The pipeline does not assume that the first retrieval pass will yield
+sufficient evidence.  Instead, the confidence scorer and coverage validator
+assess the graph after Stage~6, and the adaptive expansion loop re-retrieves
+and re-builds when coverage is insufficient.  This is bounded to 2 iterations
+to prevent runaway latency, and a deduplication set on refinement queries
+prevents oscillation.
+
+\subsection{Caching Strategy}
+
+The \texttt{EmbeddingService} singleton maintains a 2000-entry LRU cache
+of text embeddings, preventing redundant model inference when the same entity
+label appears across multiple papers.  Session-level caching in
+\texttt{SessionState} enables follow-up queries to reuse graphs and papers,
+reducing latency by an order of magnitude for conversational interactions.
+
+% =============================================================================
+\section{Implementation Details}
+% =============================================================================
+
+\subsection{Libraries and Dependencies}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Library} & \textbf{Purpose} \\
+\midrule
+\texttt{groq}                & Groq API client for LLM calls \\
+\texttt{openai}              & OpenAI-compatible API client \\
+\texttt{sentence-transformers}& \texttt{all-MiniLM-L6-v2} embedding model \\
+\texttt{networkx}            & In-memory directed graph construction \\
+\texttt{requests}            & HTTP client for academic API calls \\
+\texttt{scikit-learn}        & Cosine similarity computation \\
+\texttt{numpy}               & Numerical operations on embeddings \\
+\texttt{streamlit}           & Web dashboard \\
+\texttt{pyvis}               & Interactive graph visualization \\
+\texttt{python-dotenv}       & Environment variable management \\
+\bottomrule
+\end{tabular}
+\caption{Production dependencies after cleanup.}
+\end{table}
+
+\subsection{External APIs}
+
+\begin{itemize}[nosep]
+  \item \textbf{Groq API} --- primary LLM backend, using configurable models
+        (default: \texttt{llama-3.1-8b-instant}).  Used for query planning,
+        domain detection, query expansion, entity extraction, and answer
+        generation.
+  \item \textbf{Ollama} --- local LLM fallback.  Each module that calls Groq
+        can optionally route through a local Ollama instance first
+        (\texttt{USE\_OLLAMA\_PRIMARY=1}), with automatic fallback to Groq
+        if Ollama is unavailable.
+  \item \textbf{Europe PMC API} --- free, no authentication required.
+  \item \textbf{arXiv API} --- free, XML response format parsed with
+        \texttt{xml.etree.ElementTree}.
+  \item \textbf{OpenAlex API} --- free, JSON response format.
+\end{itemize}
+
+\subsection{Concurrency}
+
+The system employs concurrency at two levels:
+
+\begin{enumerate}[nosep]
+  \item \textbf{Paper retrieval} --- API sources are queried in parallel via
+        \texttt{ThreadPoolExecutor} with \texttt{as\_completed()}.  The dual
+        retrieval pattern (original + expanded query) doubles the effective
+        parallelism.
+  \item \textbf{Entity extraction} --- paper abstracts are processed
+        concurrently with up to \texttt{ENTITY\_EXTRACTION\_MAX\_WORKERS}
+        (default 4) threads.  A threading \texttt{Lock} protects the Groq
+        client and the rate-limit flag.
+\end{enumerate}
+
+\subsection{Caching Mechanisms}
+
+\begin{itemize}[nosep]
+  \item \textbf{Embedding cache}: \texttt{OrderedDict}-based LRU cache in
+        \texttt{EmbeddingService}, max 2000 entries.
+  \item \textbf{Paper cache}: \texttt{OrderedDict} in \texttt{SessionState},
+        max 500 entries, FIFO eviction.
+  \item \textbf{Extraction cache}: \texttt{OrderedDict} in
+        \texttt{SessionState}, max 300 entries.
+  \item \textbf{Model health cache}: process-level dictionary in
+        \texttt{main.py} that records whether each extractor model passed
+        a precheck, avoiding repeated health probes.
+\end{itemize}
+
+% =============================================================================
+\section{Challenges Faced}
+% =============================================================================
+
+This section describes real engineering challenges encountered during
+development, as evidenced by the specific patterns and fallback mechanisms
+implemented in the codebase.
+
+\subsection{API Rate Limiting and Transient Failures}
+
+The Groq API imposes per-minute rate limits that become binding during bulk
+entity extraction, where 10--15 sequential LLM calls are made in rapid
+succession.  The system addresses this at multiple levels:
+
+\begin{itemize}[nosep]
+  \item Per-API retry loops with exponential backoff (base 0.5s, jitter up to
+        0.3s) in the entity extractor.
+  \item A circuit-breaker pattern in \texttt{EntityExtractor}: when a 429
+        error is detected, the \texttt{\_groq\_rate\_limited} flag is set and
+        all subsequent calls redirect to Ollama for the remainder of the run.
+  \item \texttt{urllib3.util.Retry} on the HTTP session in
+        \texttt{PaperRetriever} for automatic retries on 429/5xx responses
+        from academic APIs.
+\end{itemize}
+
+\subsection{LLM JSON Parsing Failures}
+
+The entity extraction prompt requests structured JSON, but LLMs frequently
+return malformed responses: trailing commas, unquoted keys, markdown code
+fences wrapping the JSON, or free-text preambles.  The three-tier fallback in
+\texttt{EntityExtractor} addresses this progressively:
+
+\begin{enumerate}[nosep]
+  \item The full prompt attempt parses the response with \texttt{json.loads()}.
+  \item On failure, a regex strips markdown fences and trailing commas before
+        retrying \texttt{json.loads()}.
+  \item If JSON parsing fails entirely, the heuristic fallback extracts
+        entities via noun-phrase regex and infers relations from sentence-level
+        co-occurrence.
+\end{enumerate}
+
+\subsection{Entity Duplication Across Papers}
+
+Multiple papers frequently describe the same concept with different surface
+forms (e.g., ``machine learning'', ``ML'', ``Machine-Learning'').  Without
+normalization, the graph becomes cluttered with near-duplicate nodes that
+dilute centrality scores and reasoning path quality.  The two-pass
+normalization in \texttt{GraphBuilder} (canonical text normalization followed
+by embedding-similarity clustering with union-find) reduces duplication by
+merging entities above 0.82 cosine similarity within the same type.
+
+\subsection{Latency from Sequential API Calls}
+
+The initial implementation made sequential HTTP requests to each academic API
+source, resulting in retrieval times of 60--70 seconds.  Parallelizing the
+API calls via \texttt{ThreadPoolExecutor} reduced retrieval latency to
+approximately 10 seconds, a $6\text{--}7\times$ improvement.
+
+\subsection{Sparse Graphs for Niche Queries}
+
+Queries on narrow topics sometimes yield only 2--3 relevant papers, producing
+graphs with very few nodes and edges.  The system handles this through:
+
+\begin{itemize}[nosep]
+  \item Sparse graph detection in \texttt{AnswerGenerator} (supplementing with
+        raw abstracts when edges $<$ \texttt{SPARSE\_GRAPH\_THRESHOLD}).
+  \item The adaptive expansion loop, which re-retrieves with an expanded query.
+  \item Minimum-node guarantees in the relevance gate (always keeping at least
+        5 entities).
+\end{itemize}
+
+% =============================================================================
+\section{Mistakes and Lessons Learned}
+% =============================================================================
+
+\subsection{Over-Reliance on LLM Output Structure}
+
+Early versions assumed the extraction LLM would consistently return valid JSON.
+In practice, approximately 15--20\% of extraction calls returned malformed
+output.  The lesson was to treat LLM output as untrusted input and always
+implement parsing with fallback tiers.  The three-tier extraction cascade and
+the heuristic fallback were added as a direct result.
+
+\subsection{Hardcoded Configuration Drift}
+
+Model names, temperature values, and token budgets were initially hardcoded in
+individual module constructors.  As the number of LLM-calling modules grew to
+six, these values drifted out of sync, making it impossible to change the model
+globally without editing every file.  Centralizing all configuration in
+\texttt{config/settings.py} with environment variable overrides resolved this.
+
+\subsection{Aggressive Filtering Removing Good Papers}
+
+An early version of the adaptive percentile filter used a fixed similarity
+threshold rather than a percentile-based one.  This caused queries with
+uniformly moderate similarity scores to lose all papers.  Switching to a
+percentile-based threshold (keep top 60\%) ensured that filtering adapts to
+the score distribution rather than applying an absolute cutoff.
+
+\subsection{Graph Density vs.\ Noise Tradeoff}
+
+The graph densification steps (co-occurrence edges, semantic bridges) were
+added to improve connectivity, but initially they connected too many unrelated
+nodes.  Tuning the minimum co-occurrence count to 2 and the semantic bridge
+similarity threshold to 0.62, and skipping generic-node removal on graphs with
+fewer than 12 nodes, achieved a balance between density and precision.
+
+% =============================================================================
+\section{Final Pre-Submission Improvements}
+% =============================================================================
+
+The following mechanical fixes were applied during the final cleanup pass,
+with no changes to pipeline logic or architecture.
+
+\subsection{Removed Unused Dependencies}
+
+Three packages (\texttt{neo4j}, \texttt{pandas}, \texttt{matplotlib}) were
+listed in \texttt{requirements.txt} but never imported anywhere in the
+codebase.  They were removed to reduce install size and eliminate potential
+dependency conflicts.
+
+\subsection{Fixed Hardcoded Model Names}
+
+The string \texttt{"llama-3.1-8b-instant"} was hardcoded in six module
+constructors and one inline Groq call, despite \texttt{config/settings.py}
+providing centralized constants (\texttt{QUERY\_PLANNER\_MODEL},
+\texttt{ENTITY\_EXTRACTION\_MODEL}).  All occurrences were replaced with the
+appropriate settings constant, ensuring a single source of truth.
+
+\subsection{Fixed \texttt{max\_tokens} Inconsistency}
+
+The \texttt{AnswerGenerator.\_call\_llm()} method hardcoded
+\texttt{max\_tokens=1024} while \texttt{settings.py} defined
+\texttt{ANSWER\_PROMPT\_TOKEN\_BUDGET = 2400} for the answer generation
+context.  The hardcoded value was replaced with the settings constant to
+prevent silent answer truncation.
+
+\subsection{Fixed Temperature Inconsistency}
+
+The \texttt{QueryPlanner.\_call\_llm()} method hardcoded
+\texttt{temperature=0.0} despite \texttt{settings.py} defining
+\texttt{QUERY\_PLANNER\_TEMPERATURE = 0.1}.  The hardcoded value was replaced
+with the settings constant.
+
+\subsection{Logging Improvements}
+
+Thirty-five f-string logger calls across \texttt{main.py},
+\texttt{answer\_generator.py}, and \texttt{paper\_retriever.py} were
+converted to lazy \%-formatting (e.g., \texttt{logger.info("Found \%d papers",
+count)}).  This avoids string interpolation when the log level is disabled
+and follows Python logging best practices.
+
+\subsection{Dead Code Removal}
+
+An unused variable \texttt{entity\_by\_label} in
+\texttt{entity\_extractor.py} (line 719) was built as a dictionary
+comprehension but never referenced.  It was removed.
+
+% =============================================================================
+\section{Evaluation}
+% =============================================================================
+
+\subsection{Evaluation Framework}
+
+The evaluation module (\texttt{evaluation/evaluator.py}) implements a
+four-mode ablation study across a 22-question benchmark dataset:
+
+\begin{itemize}[nosep]
+  \item 12 single-hop questions (3 per domain: Agriculture, Geoscience,
+        Environment, Supply Chain);
+  \item 10 multi-hop questions requiring cross-paper reasoning.
+\end{itemize}
+
+\subsection{Ablation Modes}
+
+Each question is answered under four configurations of increasing complexity:
+
+\begin{enumerate}[nosep]
+  \item \textbf{classic\_rag} --- top-3 paper abstracts concatenated as
+        plain text (no graph, no reasoning, no expansion).
+  \item \textbf{graphrag\_base} --- full graph pipeline but with reasoning
+        controller, confidence scoring, and expansion disabled.
+  \item \textbf{graphrag\_reasoning\_only} --- graph pipeline with reasoning
+        paths enabled but no confidence-driven expansion.
+  \item \textbf{graphrag\_full} --- complete pipeline with all features
+        enabled, including adaptive expansion.
+\end{enumerate}
+
+\subsection{Metrics}
+
+The following metrics are computed for each answer:
+
+\begin{itemize}[nosep]
+  \item \textbf{ROUGE-1 F1} --- unigram overlap with the reference answer.
+  \item \textbf{ROUGE-2 F1} --- bigram overlap with the reference answer.
+  \item \textbf{Keyword coverage} --- fraction of reference keywords found
+        in the generated answer.
+  \item \textbf{Semantic similarity} --- cosine similarity between the
+        answer embedding and the reference embedding.
+  \item \textbf{Citation grounding} --- whether the answer cites paper
+        evidence.
+  \item \textbf{LLM-as-judge} --- a separate LLM call scores the answer on
+        relevance, completeness, and factual accuracy (repeated with
+        configurable judge repeats for stability).
+\end{itemize}
+
+% =============================================================================
+\section{Limitations}
+% =============================================================================
+
+\begin{enumerate}[nosep]
+  \item \textbf{LLM dependency} --- the system relies on external LLM APIs
+        (Groq) for five of its eight stages.  API downtime, rate limits, or
+        model deprecation directly impact pipeline availability.  The Ollama
+        fallback mitigates but does not eliminate this risk.
+  \item \textbf{Abstract-only extraction} --- entities and relations are
+        extracted from paper abstracts only, not full texts.  This limits the
+        depth of extracted knowledge, particularly for method-heavy papers
+        where key details appear in the body.
+  \item \textbf{No persistent knowledge accumulation} --- the graph is
+        discarded after each query.  Repeated questions about the same topic
+        rebuild the graph from scratch (unless session caching applies).
+  \item \textbf{Five-domain scope} --- while the entity vocabulary is
+        domain-agnostic, the domain detector and keyword dictionaries currently
+        cover only five scientific domains.  Queries outside these domains
+        will be misclassified.
+  \item \textbf{No citation verification} --- the system includes paper
+        references in answers but does not verify that the specific claims
+        attributed to a paper are actually present in its abstract.
+  \item \textbf{Single-model extraction} --- all extraction uses the same
+        LLM model.  A smaller, faster model for simple entities and a larger
+        model for complex relations could improve both speed and quality.
+  \item \textbf{Latency} --- end-to-end latency for a full pipeline run
+        (including API calls, extraction, and graph construction) ranges from
+        15 to 45 seconds depending on query complexity and API response times.
+\end{enumerate}
+
+% =============================================================================
+\section{Future Work}
+% =============================================================================
+
+The following improvements are practical next steps based on observed
+limitations in the current system:
+
+\begin{enumerate}[nosep]
+  \item \textbf{Full-text extraction} --- extend entity extraction beyond
+        abstracts to full paper text (where available), significantly
+        increasing the density and accuracy of extracted knowledge.
+  \item \textbf{Persistent graph accumulation} --- maintain a session-level
+        or user-level persistent graph that grows across queries, reducing
+        redundant extraction for related questions.
+  \item \textbf{Retrieval source expansion} --- add Semantic Scholar and
+        PubMed as additional retrieval sources for broader coverage.
+  \item \textbf{Extraction model tiering} --- use a fast model for initial
+        extraction and a larger model for repair/refinement of low-confidence
+        extractions.
+  \item \textbf{Citation grounding verification} --- cross-reference specific
+        claims in the generated answer against the source paper abstracts to
+        detect hallucinated citations.
+  \item \textbf{Domain auto-detection expansion} --- allow the system to
+        handle queries outside the five predefined domains by falling back
+        to a fully LLM-driven classification without keyword dictionaries.
+  \item \textbf{Streaming answers} --- implement token-level streaming from
+        the LLM API to the Streamlit frontend, reducing perceived latency.
+  \item \textbf{Evaluation expansion} --- increase the benchmark dataset
+        beyond 22 questions and add domain-expert human evaluation alongside
+        automated metrics.
+\end{enumerate}
+
+% =============================================================================
+\section{Conclusion}
+% =============================================================================
+
+Dynamic GraphRAG demonstrates that constructing ephemeral knowledge graphs from
+live academic literature meaningfully improves scientific question answering
+compared to flat retrieval-augmented generation.  The system's key contributions
+are:
+
+\begin{enumerate}[nosep]
+  \item A plan-driven pipeline architecture where an LLM-generated query plan
+        shapes every stage from retrieval weighting to answer structure.
+  \item A domain-agnostic entity and relation vocabulary that supports five
+        scientific domains without per-domain prompts or keyword lists.
+  \item A confidence-driven adaptive expansion loop that automatically
+        re-retrieves and re-builds the graph when coverage is insufficient,
+        bounded to prevent runaway latency.
+  \item A three-tier extraction fallback (full prompt, strict JSON, heuristic)
+        with a Groq-to-Ollama circuit breaker that ensures extraction
+        completes even under API rate limits.
+  \item A four-mode ablation evaluation framework that isolates the
+        contribution of reasoning, confidence scoring, and adaptive expansion.
+\end{enumerate}
+
+The system is fully operational, with a Streamlit dashboard providing
+interactive querying, knowledge graph visualization, paper browsing, and
+pipeline debugging.  All configuration is centralized in
+\texttt{config/settings.py} with environment variable overrides, and the
+codebase has been cleaned for production readiness.
+
+\end{document}

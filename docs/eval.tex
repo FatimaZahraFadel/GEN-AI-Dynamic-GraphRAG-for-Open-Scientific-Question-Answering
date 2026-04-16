@@ -1,0 +1,50 @@
+
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{array}
+\usepackage{booktabs}
+\usepackage[table]{xcolor}
+\usepackage{caption}
+
+% Purple line color
+\definecolor{linepurple}{RGB}{128,0,128}
+
+\begin{document}
+
+\begin{table}[htbp]
+\centering
+\arrayrulecolor{linepurple}
+\setlength{\arrayrulewidth}{0.9pt}
+\renewcommand{\arraystretch}{1.2}
+
+\caption{Evaluation Results (5 Questions)}
+\label{tab:evaluation_results}
+
+% White background rows + purple borders
+\begin{tabular}{|l|c|c|c|c|c|c|}
+\hline
+\rowcolor{white}
+\textbf{Mode} & \textbf{Grounded.} & \textbf{Reasoning} & \textbf{Halluc. Res.} & \textbf{Trace Quality} & \textbf{Runtime (s)} & \textbf{LLM Calls} \\
+\hline
+\rowcolor{white}
+Classic RAG             & 4.4 & 3.6 & 4.6 & 4.0 & 7.716   & 1.0 \\
+\hline
+\rowcolor{white}
+GraphRAG Base           & 5.0 & 4.0 & 4.8 & 4.0 & 188.383 & 11.8 \\
+\hline
+\rowcolor{white}
+GraphRAG Reasoning Only & 5.0 & 4.4 & 5.0 & 4.4 & 202.673 & 12.4 \\
+\hline
+\rowcolor{white}
+GraphRAG Full           & 5.0 & 4.4 & 5.0 & 4.4 & 216.235 & 13.4 \\
+\hline
+\end{tabular}
+\end{table}
+
+\end{document}
+
+
