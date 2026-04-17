@@ -30,3 +30,4 @@ evaluation/evaluation_results.json
 *.out
 *.synctex.gz
 *.toc
+*.tex
