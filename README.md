@@ -1,123 +1,204 @@
 # Dynamic GraphRAG for Open Scientific Question Answering
 
-A pipeline that answers scientific questions by dynamically building a knowledge
-graph from freshly retrieved academic papers and using it as retrieval context for
-an LLM.
+Dynamic GraphRAG is an end-to-end scientific QA system that retrieves live papers,
+builds a query-specific knowledge graph, retrieves a focused subgraph, and generates
+grounded answers with confidence and coverage signals.
+
+## What Is Implemented
+
+- Plan-driven pipeline with `QueryPlanner` (reasoning type, entities, extraction/retrieval priorities)
+- Robust domain detection (`DomainDetector`) with consensus strategies
+- Multi-source paper retrieval from Europe PMC, arXiv, and OpenAlex
+- LLM query expansion + dual retrieval (original query + expanded query)
+- Plan-aware reranking using:
+  - semantic similarity (`alpha=0.6`)
+  - plan keyword overlap (`beta=0.25`)
+  - metadata quality (citation + recency, `gamma=0.15`)
+- Hybrid paper filtering with semantic, lexical, metadata, and intent alignment
+- Domain-agnostic entity/relation extraction with multi-tier fallback
+- Query-aware graph construction and subgraph retrieval with reasoning paths
+- Confidence/coverage scoring with adaptive expansion loop (up to 2 iterations)
+- LLM answer generation with low-confidence handling
+- Graph-only Answer Compiler module + demo script
+- Streamlit app for interactive exploration and graph visualization
+- Evaluation harness with 4 ablation modes
 
 ## Pipeline Overview
 
 ```
 User Query
-    │
-    ▼
-1. DomainDetector    — classify query into scientific domain(s)
-    │
-    ▼
-2. PaperRetriever    — fetch papers from Semantic Scholar & OpenAlex
-    │
-    ▼
-3. PaperFilter       — embed & rank papers by semantic similarity
-    │
-    ▼
-4. EntityExtractor   — extract concepts, methods, datasets via LLM
-    │
-    ▼
-5. GraphBuilder      — build knowledge graph (papers + entities + edges)
-    │
-    ▼
-6. GraphRetriever    — retrieve query-relevant subgraph
-    │
-    ▼
-7. AnswerGenerator   — generate grounded answer via RAG prompt
-    │
-    ▼
-  Answer
+    |
+    v
+0) QueryPlanner        -> reasoning type + entities + graph requirements
+    |
+    v
+1) DomainDetector      -> domain + subdomain
+    |
+    v
+2) PaperRetriever      -> Europe PMC + arXiv + OpenAlex
+                        -> query expansion + dual retrieval + dedup + rerank
+    |
+    v
+3) PaperFilter         -> hybrid ranking + consistency assessment
+    |
+    v
+4) EntityExtractor     -> typed entities/relations (Groq with fallback)
+    |
+    v
+5) GraphBuilder        -> query-focused directed knowledge graph
+    |
+    v
+6) GraphRetriever      -> relevant subgraph + reasoning paths + validation
+    |
+    +--> (if low confidence / low coverage) Adaptive Retry (max 2 iters)
+    |
+    v
+7) AnswerGenerator     -> grounded final answer
+    |
+    v
+Confidence/Coverage + Metrics + Artifacts
+```
+
+## Repository Structure
+
+```
+.
+├── app.py                           # Streamlit UI (interactive GraphRAG explorer)
+├── main.py                          # Pipeline orchestration and run_pipeline()
+├── requirements.txt
+├── .env.example
+├── config/
+│   └── settings.py                  # Runtime defaults and feature toggles
+├── pipeline/
+│   ├── query_planner.py             # Stage 0
+│   ├── domain_detector.py           # Stage 1
+│   ├── paper_retriever.py           # Stage 2
+│   ├── paper_filter.py              # Stage 3
+│   ├── entity_extractor.py          # Stage 4
+│   ├── graph_builder.py             # Stage 5
+│   ├── graph_retriever.py           # Stage 6
+│   ├── answer_generator.py          # Stage 7
+│   ├── answer_compiler.py           # Graph-only compiler / validator module
+│   ├── adaptive_retry.py            # Confidence-driven expansion helpers
+│   ├── confidence_scorer.py         # Confidence and coverage scoring
+│   └── embedding_service.py         # Shared embedding service/cache
+├── models/
+│   ├── paper.py
+│   └── graph_node.py
+├── utils/
+│   ├── logger.py
+│   ├── helpers.py
+│   └── session_state.py             # Session-level caching/reuse
+├── evaluation/
+│   └── evaluator.py                 # Ablation + metrics evaluation harness
+├── docs/
+│   ├── report.tex
+│   └── report.pdf
+└── test_answer_compiler_demo.py     # Answer compiler demonstrations
 ```
 
 ## Setup
 
-1. **Clone / download** the project.
+1. Create and activate a virtual environment.
 
-2. **Create a virtual environment** and install dependencies:
-
-   ```bash
-   python -m venv .venv
-   source .venv/bin/activate      # Windows: .venv\Scripts\activate
-   pip install -r requirements.txt
-   ```
-
-3. **Configure environment variables** — copy `.env.example` to `.env` and fill
-   in your API keys:
-
-   ```bash
-   cp .env.example .env
-   ```
-
-   | Variable | Description |
-   |---|---|
-    | `GROQ_API_KEY` | Groq API key for extraction/generation |
-   | `SEMANTIC_SCHOLAR_API_KEY` | Semantic Scholar API key (optional but recommended) |
-   | `OPENALEX_EMAIL` | Your email for OpenAlex polite-pool access |
-
-    Optional local Llama fallback for entity extraction (recommended if you hit Groq 429 limits):
-
-    | Variable | Description |
-    |---|---|
-    | `USE_OLLAMA_EXTRACTION_FALLBACK` | Set to `1` to enable local Ollama fallback |
-    | `OLLAMA_BASE_URL` | Ollama URL (default: `http://localhost:11434`) |
-    | `OLLAMA_EXTRACTION_MODEL` | Local model name (example: `llama3.1:8b`) |
-
-    Optional Ollama-primary mode for planner/retriever/answer/evaluator:
-
-    | Variable | Description |
-    |---|---|
-    | `USE_OLLAMA_PRIMARY` | Set to `1` to call Ollama first across LLM stages |
-    | `OLLAMA_GENERAL_MODEL` | Local model for planner/retriever/answer/judge |
-    | `OLLAMA_TIMEOUT_SECONDS` | Request timeout for Ollama calls |
-
-4. **Run the pipeline**:
-
-   ```bash
-   python main.py
-   ```
-
-## Project Structure
-
-```
-dynamic-graphrag/
-├── main.py                   # Entry point & pipeline orchestration
-├── requirements.txt
-├── .env.example
-├── config/
-│   └── settings.py           # Global constants (domains, limits, model names)
-├── pipeline/
-│   ├── domain_detector.py    # Stage 1 — query classification
-│   ├── paper_retriever.py    # Stage 2 — paper retrieval from APIs
-│   ├── paper_filter.py       # Stage 3 — embedding-based filtering
-│   ├── entity_extractor.py   # Stage 4 — LLM entity extraction
-│   ├── graph_builder.py      # Stage 5 — knowledge graph construction
-│   ├── graph_retriever.py    # Stage 6 — subgraph retrieval
-│   └── answer_generator.py   # Stage 7 — RAG answer generation
-├── models/
-│   ├── paper.py              # Paper dataclass
-│   └── graph_node.py         # GraphNode dataclass
-├── utils/
-│   ├── logger.py             # Logging utilities
-│   └── helpers.py            # General helpers (chunking, similarity, etc.)
-└── evaluation/
-    └── evaluator.py          # ROUGE / BERTScore / exact-match / LLM-judge
+```bash
+python -m venv .venv
+# Windows PowerShell
+.venv\Scripts\Activate.ps1
+# macOS/Linux
+# source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-## Configuration
+2. Copy environment template:
 
-Edit `config/settings.py` to adjust:
+```bash
+# Windows PowerShell
+Copy-Item .env.example .env
+# macOS/Linux
+# cp .env.example .env
+```
 
-- `DOMAINS` — list of supported scientific domains
-- `TOP_N_PAPERS` — papers retained after filtering
-- `MAX_GRAPH_NODES` — node cap for the knowledge graph
-- `EMBEDDING_MODEL` — sentence-transformers model name
+3. Fill required values in `.env`.
+
+## Environment Variables
+
+### Required
+
+| Variable | Description |
+|---|---|
+| `GROQ_API_KEY` | API key used by LLM stages (planner, retrieval expansion, extraction, generation, evaluation judge) |
+
+### Optional
+
+| Variable | Description |
+|---|---|
+| `OPENALEX_EMAIL` | Contact email for OpenAlex polite-pool requests |
+| `USE_OLLAMA_EXTRACTION_FALLBACK` | `1` to allow extraction fallback to local Ollama |
+| `OLLAMA_BASE_URL` | Ollama endpoint (default `http://localhost:11434`) |
+| `OLLAMA_EXTRACTION_MODEL` | Local extraction model name |
+| `USE_OLLAMA_PRIMARY` | `1` to route planner/retriever/answer/eval calls to Ollama first |
+| `OLLAMA_GENERAL_MODEL` | Local model for general LLM stages |
+| `OLLAMA_TIMEOUT_SECONDS` | Timeout for Ollama requests |
+| `ENTITY_EXTRACTION_MODEL` | Override extraction model |
+| `ENTITY_EXTRACTION_FAST_MODEL` | Override fast extraction model |
+| `QUERY_PLANNER_MODEL` | Override planner model |
+| `QUERY_PLANNER_MAX_TOKENS` | Planner token budget |
+| `QUERY_PLANNER_TEMPERATURE` | Planner temperature |
+| `PLAN_AWARE_RETRIEVAL_ALPHA` | Semantic similarity weight (default `0.6`) |
+| `PLAN_AWARE_RETRIEVAL_BETA` | Plan keyword overlap weight (default `0.25`) |
+| `PLAN_AWARE_RETRIEVAL_GAMMA` | Metadata quality weight (default `0.15`) |
+
+Note: `.env.example` currently includes `SEMANTIC_SCHOLAR_API_KEY` for legacy compatibility, but the active retriever implementation uses Europe PMC, arXiv, and OpenAlex.
+
+## Running
+
+### 1) Run pipeline from CLI
+
+```bash
+python main.py
+```
+
+### 2) Run Streamlit app
+
+```bash
+streamlit run app.py
+```
+
+### 3) Run Answer Compiler demo
+
+```bash
+python test_answer_compiler_demo.py
+```
 
 ## Evaluation
 
-Pass a JSON dataset of `{"question": "...", "answer": "..."}` records to
-`run_evaluation()` in `main.py`, or call the `Evaluator` class directly.
+The evaluation harness compares these modes:
+
+- `classic_rag`
+- `graphrag_base`
+- `graphrag_reasoning_only`
+- `graphrag_full`
+
+It reports metrics including ROUGE-1/ROUGE-2, keyword coverage, semantic similarity,
+answer length, and optional LLM-judge scoring.
+
+Use `evaluation/evaluator.py` to run benchmark evaluations.
+
+## Core Configuration (`config/settings.py`)
+
+Most runtime behavior is controlled in `config/settings.py`, including:
+
+- domain list (`DOMAINS`)
+- retrieval/filter limits (`TOP_N_PAPERS`, `FAST_MODE_TOP_N_PAPERS`, `FAST_MODE_TOP_K_PAPERS`)
+- extraction concurrency and model controls
+- graph confidence threshold + expansion limits
+- planner budgets and temperatures
+- plan-aware retrieval weights (`PLAN_AWARE_RETRIEVAL_ALPHA/BETA/GAMMA`)
+
+## Notes
+
+- The system is domain-agnostic by design, with current domain detectors tuned for:
+  Agriculture, Geoscience, Computer Science, Supply Chain, and Environment.
+- Session-aware caching is implemented (`utils/session_state.py`) to speed up follow-up queries.
+- Report artifacts are available in `docs/report.tex` and `docs/report.pdf`.

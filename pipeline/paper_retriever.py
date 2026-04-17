@@ -14,6 +14,7 @@ Upgrades
 import os
 import re
 import time
+import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 from typing import List, Optional
@@ -286,17 +287,6 @@ class PaperRetriever:
             return ["arxiv", "openalex", "europe_pmc"]
         return ["openalex", "europe_pmc", "arxiv"]
 
-    def _intent_alignment_score(self, paper: Paper, plan: Optional[dict]) -> float:
-        if not plan:
-            return 0.0
-        intent_signals = [str(s).lower() for s in (plan.get("intent_signals") or [])]
-        dimensions = [str(d).lower() for d in (plan.get("dimensions") or [])]
-        text = f"{paper.title}. {paper.abstract or ''}".lower()
-        signal_hits = sum(1 for s in intent_signals if s and s in text)
-        dim_hits = sum(1 for d in dimensions if d and d in text)
-        denom = max(len(intent_signals) + len(dimensions), 1)
-        return (signal_hits + dim_hits) / denom
-
     def _keyword_overlap_score(self, text: str, plan: Optional[dict], question: str) -> float:
         if not text:
             return 0.0
@@ -309,6 +299,14 @@ class PaperRetriever:
         text_l = text.lower()
         hits = sum(1 for t in terms if t and t in text_l)
         return hits / max(len(terms), 1)
+
+    def _metadata_quality_score(self, paper: Paper) -> float:
+        """Compute metadata quality from citation count and recency."""
+        citation_score = min(math.log1p(max(int(paper.citation_count or 0), 0)) / 6.0, 1.0)
+        recency_score = 0.0
+        if paper.year is not None:
+            recency_score = max(0.0, min((int(paper.year) - 1990) / 40.0, 1.0))
+        return 0.7 * citation_score + 0.3 * recency_score
 
     def _rerank_with_plan(self, papers: List[Paper], question: str, plan: Optional[dict]) -> List[Paper]:
         if not papers:
@@ -328,11 +326,11 @@ class PaperRetriever:
         for i, paper in enumerate(papers):
             text = corpus[i]
             lexical = self._keyword_overlap_score(text=text, plan=plan, question=question)
-            intent = self._intent_alignment_score(paper, plan)
+            metadata = self._metadata_quality_score(paper)
             hybrid = (
                 PLAN_AWARE_RETRIEVAL_ALPHA * float(semantic[i])
                 + PLAN_AWARE_RETRIEVAL_BETA * lexical
-                + PLAN_AWARE_RETRIEVAL_GAMMA * intent
+                + PLAN_AWARE_RETRIEVAL_GAMMA * metadata
             )
             paper.relevance_score = float(hybrid)
             scored.append((hybrid, paper))
