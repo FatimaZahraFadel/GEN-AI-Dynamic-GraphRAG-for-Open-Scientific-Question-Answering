@@ -4,6 +4,14 @@ Dynamic GraphRAG is an end-to-end scientific QA system that retrieves live paper
 builds a query-specific knowledge graph, retrieves a focused subgraph, and generates
 grounded answers with confidence and coverage signals.
 
+## Quick Start
+
+```bash
+pip install -r requirements.txt
+Copy-Item .env.example .env
+streamlit run app.py
+```
+
 ## What Is Implemented
 
 - Plan-driven pipeline with `QueryPlanner` (reasoning type, entities, extraction/retrieval priorities)
@@ -171,6 +179,13 @@ streamlit run app.py
 python test_answer_compiler_demo.py
 ```
 
+### Runtime Expectations
+
+- Full pipeline runs are typically slower than classic RAG because retrieval,
+    extraction, graph construction, and validation all run at inference time.
+- Typical end-to-end latency is around 15 to 45 seconds, depending on query
+    complexity and external API responsiveness.
+
 ## Evaluation
 
 The evaluation harness compares these modes:
@@ -202,3 +217,5 @@ Most runtime behavior is controlled in `config/settings.py`, including:
   Agriculture, Geoscience, Computer Science, Supply Chain, and Environment.
 - Session-aware caching is implemented (`utils/session_state.py`) to speed up follow-up queries.
 - Report artifacts are available in `docs/report.tex` and `docs/report.pdf`.
+- Known limitations and tradeoffs are documented in `docs/report.tex`
+    (see the "Limitations" section).
