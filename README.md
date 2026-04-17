@@ -1,7 +1,7 @@
 # Dynamic GraphRAG for Open Scientific Question Answering
 
-Dynamic GraphRAG is an end-to-end scientific QA system that retrieves live papers,
-builds a query-specific knowledge graph, retrieves a focused subgraph, and generates
+Dynamic GraphRAG is an end-to-end scientific QA pipeline that retrieves live papers,
+builds a query-specific knowledge graph, extracts a focused subgraph, and returns
 grounded answers with confidence and coverage signals.
 
 ## Quick Start
@@ -14,20 +14,20 @@ streamlit run app.py
 
 ## What Is Implemented
 
-- Plan-driven pipeline with `QueryPlanner` (reasoning type, entities, extraction/retrieval priorities)
+- Plan-driven pipeline with `QueryPlanner` (reasoning type, entities, priorities)
 - Robust domain detection (`DomainDetector`) with consensus strategies
 - Multi-source paper retrieval from Europe PMC, arXiv, and OpenAlex
-- LLM query expansion + dual retrieval (original query + expanded query)
+- LLM query expansion + dual retrieval (original and expanded query)
 - Plan-aware reranking using:
   - semantic similarity (`alpha=0.6`)
   - plan keyword overlap (`beta=0.25`)
   - metadata quality (citation + recency, `gamma=0.15`)
 - Hybrid paper filtering with semantic, lexical, metadata, and intent alignment
-- Domain-agnostic entity/relation extraction with multi-tier fallback
+- Domain-agnostic entity/relation extraction with tiered fallback
 - Query-aware graph construction and subgraph retrieval with reasoning paths
-- Confidence/coverage scoring with adaptive expansion loop (up to 2 iterations)
-- LLM answer generation with low-confidence handling
-- Graph-only Answer Compiler module + demo script
+- Confidence/coverage scoring with adaptive expansion (up to 2 iterations)
+- LLM answer generation with low-confidence fallback handling
+- Graph-only Answer Compiler module and demo script
 - Streamlit app for interactive exploration and graph visualization
 - Evaluation harness with 4 ablation modes
 
@@ -118,7 +118,7 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-2. Copy environment template:
+2. Copy the environment template:
 
 ```bash
 # Windows PowerShell
@@ -181,9 +181,9 @@ python test_answer_compiler_demo.py
 
 ### Runtime Expectations
 
-- Full pipeline runs are typically slower than classic RAG because retrieval,
-    extraction, graph construction, and validation all run at inference time.
-- Typical end-to-end latency is around 15 to 45 seconds, depending on query
+- Full runs are slower than classic RAG because retrieval, extraction,
+    graph construction, and validation run at inference time.
+- Typical end-to-end latency is 15 to 45 seconds, depending on query
     complexity and external API responsiveness.
 
 ## Evaluation
@@ -195,8 +195,8 @@ The evaluation harness compares these modes:
 - `graphrag_reasoning_only`
 - `graphrag_full`
 
-It reports metrics including ROUGE-1/ROUGE-2, keyword coverage, semantic similarity,
-answer length, and optional LLM-judge scoring.
+It reports ROUGE-1/ROUGE-2, keyword coverage, semantic similarity,
+answer length, and optional LLM-as-a-judge scoring.
 
 Use `evaluation/evaluator.py` to run benchmark evaluations.
 
@@ -207,7 +207,7 @@ Most runtime behavior is controlled in `config/settings.py`, including:
 - domain list (`DOMAINS`)
 - retrieval/filter limits (`TOP_N_PAPERS`, `FAST_MODE_TOP_N_PAPERS`, `FAST_MODE_TOP_K_PAPERS`)
 - extraction concurrency and model controls
-- graph confidence threshold + expansion limits
+- confidence thresholds and expansion limits
 - planner budgets and temperatures
 - plan-aware retrieval weights (`PLAN_AWARE_RETRIEVAL_ALPHA/BETA/GAMMA`)
 
